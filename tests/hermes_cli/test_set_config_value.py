@@ -374,6 +374,32 @@ class TestListNavigation:
         assert allowlist[0] == {"name": "alice", "role": "admin"}
         assert allowlist[1] == {"name": "bob", "role": "admin"}
 
+    @pytest.mark.parametrize(
+        "initial",
+        [
+            "",
+            "plugin_messaging:\n  idea-incubator:\n    outbound: stale\n",
+            "plugin_messaging:\n  idea-incubator:\n    outbound:\n      stale: value\n",
+        ],
+    )
+    def test_numeric_path_creates_or_replaces_parent_with_list(
+        self, _isolated_hermes_home, initial
+    ):
+        """A numeric segment determines the missing parent's container type."""
+        if initial:
+            self._write_config(_isolated_hermes_home, initial)
+
+        set_config_value(
+            "plugin_messaging.idea-incubator.outbound.0.platform", "telegram"
+        )
+
+        import yaml
+
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["plugin_messaging"]["idea-incubator"]["outbound"] == [
+            {"platform": "telegram"}
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Cron drift guard warning — regression tests for #59031
