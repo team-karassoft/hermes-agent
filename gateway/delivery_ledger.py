@@ -193,13 +193,15 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
-) -> None:
+    replace_existing: bool = True,
+) -> bool:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+        insert = "INSERT OR REPLACE" if replace_existing else "INSERT OR IGNORE"
+        cursor = conn.execute(
+            f"""{insert} INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at)
@@ -209,6 +211,7 @@ def record_obligation(
              pid, started),
         )
     _prune()
+    return cursor.rowcount > 0
 
 
 def mark_attempting(obligation_id: str) -> None:

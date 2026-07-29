@@ -7779,6 +7779,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    def _bind_plugin_messaging_dispatcher(self, manager=None) -> None:
+        """Route accepted plugin intents through gateway-owned tracked tasks."""
+        if manager is None:
+            from hermes_cli.plugins import get_plugin_manager
+
+            manager = get_plugin_manager()
+
+        from gateway import delivery_ledger
+        from gateway.plugin_callbacks import (
+            HostCallbackRegistry,
+            load_or_create_callback_signing_key,
+        )
+
+        callback_database_path = delivery_ledger._db_path().with_name(
+            "plugin_callbacks.db"
+        )
+        callback_registry = HostCallbackRegistry(
+            signing_key=load_or_create_callback_signing_key(
+                callback_database_path.with_name(
+                    ".plugin_callback_signing.key"
+                )
+            ),
+            database_path=callback_database_path,
+        )
+        manager.set_plugin_callback_registry(callback_registry)
+
+        def _dispatch(*, obligation_id, intent, plugin_id) -> None:
+            try:
+                platform = Platform(intent.route.platform)
+            except (TypeError, ValueError):
+                return
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                return
+
+            from gateway.plugin_outbox import PluginOutboxService
+
+            task = asyncio.create_task(
+                PluginOutboxService.deliver_persisted(
+                    adapter=adapter,
+                    obligation_id=obligation_id,
+                    intent=intent,
+                    plugin_id=plugin_id,
+                    callback_registry=callback_registry,
+                )
+            )
+            background_tasks = getattr(self, "_background_tasks", None)
+            if not isinstance(background_tasks, set):
+                background_tasks = set()
+                self._background_tasks = background_tasks
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
+        manager.set_plugin_outbound_dispatcher(_dispatch)
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -8645,6 +8700,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        self._bind_plugin_messaging_dispatcher()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -9701,6 +9757,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         async def _stop_impl() -> None:
+            try:
+                from hermes_cli.plugins import get_plugin_manager
+
+                get_plugin_manager().set_plugin_outbound_dispatcher(None)
+            except Exception:
+                logger.debug(
+                    "Failed to unbind plugin messaging dispatcher",
+                    exc_info=True,
+                )
+
             def _kill_tool_subprocesses(phase: str) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
 
@@ -11160,7 +11226,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # Phase 2 observers fan out after authorization. Only a valid host-routed
+        # consumer claim suppresses normal agent dispatch; conflicts/errors fail open.
+        if not is_internal:
+            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+                if _messaging_outcome is not None and _messaging_outcome.action == "claim":
+                    logger.info("plugin messaging consumer claimed event: plugin=%s", _messaging_outcome.consumer_plugin_id)
+                    return None
+            except Exception as _messaging_exc:
+                logger.warning("plugin messaging dispatch failed: %s", _messaging_exc)
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

@@ -345,6 +345,27 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._messaging: Any = None
+
+    @property
+    def messaging(self) -> Any:
+        """Return the plugin-safe declarative inbound messaging facade.
+
+        Subscriptions are requests only.  The host checks profile-scoped grants
+        at dispatch time, so this facade never exposes a platform adapter,
+        credentials, sender, or a caller-provided plugin identity.
+        """
+        if self._messaging is None:
+            from gateway.plugin_messaging import PluginMessagingService
+
+            self._messaging = PluginMessagingService(
+                plugin_id=self.manifest.key or self.manifest.name,
+                router=self._manager.messaging_router,
+                enqueue_text=lambda **kwargs: self._manager.enqueue_plugin_text(
+                    plugin_id=self.manifest.key or self.manifest.name, **kwargs
+                ),
+            )
+        return self._messaging
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -1290,6 +1311,104 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Phase 1 message subscriptions are host-owned and inert until an
+        # inbound event is checked against profile-scoped host grants.
+        from gateway.plugin_messaging import PluginMessageRouter
+        self._messaging_router = PluginMessageRouter()
+        self._plugin_outbound_dispatcher: Optional[Callable[..., None]] = None
+        self._plugin_callback_registry = None
+
+    @property
+    def messaging_router(self) -> Any:
+        """Return the host-owned plugin messaging router."""
+        return self._messaging_router
+
+    def enqueue_plugin_text(
+        self,
+        *,
+        plugin_id: str,
+        idempotency_key: str,
+        route: Any,
+        text: str,
+        keyboard: Any = None,
+    ) -> str:
+        """Host validates and durably records a manifest-bound plugin text intent."""
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from gateway.plugin_outbox import PluginOutboundIntent, PluginOutboxService
+        from hermes_cli.config import load_config_readonly
+        intent = PluginOutboundIntent(
+            idempotency_key=idempotency_key,
+            route=route,
+            text=text,
+            keyboard=keyboard,
+        )
+        obligation_id, accepted = PluginOutboxService(
+            HostMessagingPermissions.from_raw(load_config_readonly()),
+            callback_registry=self._plugin_callback_registry,
+        ).accept(plugin_id=plugin_id, intent=intent)
+        dispatcher = self._plugin_outbound_dispatcher
+        if dispatcher is not None and accepted:
+            try:
+                dispatcher(
+                    obligation_id=obligation_id,
+                    intent=intent,
+                    plugin_id=plugin_id,
+                )
+            except Exception:
+                # The accepted row remains pending for startup ledger recovery.
+                logger.warning(
+                    "Could not schedule immediate plugin delivery %s",
+                    obligation_id,
+                    exc_info=True,
+                )
+        return obligation_id
+
+    def set_plugin_outbound_dispatcher(
+        self, dispatcher: Optional[Callable[..., None]]
+    ) -> None:
+        """Bind or remove the active gateway-owned immediate dispatcher."""
+        self._plugin_outbound_dispatcher = dispatcher
+
+    def set_plugin_callback_registry(self, registry: Any) -> None:
+        """Install the gateway-owned registry without exposing it to plugins."""
+        self._plugin_callback_registry = registry
+        self._messaging_router.set_callback_registry(registry)
+
+    async def route_plugin_callback(self, callback: Any) -> Any:
+        """Host-only callback entry point after adapter normalization."""
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+
+        self._messaging_router.set_permissions(
+            HostMessagingPermissions.from_raw(load_config_readonly())
+        )
+        return await self._messaging_router.route_callback(callback)
+
+    async def route_messaging_event(self, event: Any) -> Any:
+        """Return Phase 2 host routing outcome for an authorized inbound event."""
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+        if not self._messaging_router.has_subscriptions:
+            return None
+        self._messaging_router.set_permissions(HostMessagingPermissions.from_raw(load_config_readonly()))
+        return await self._messaging_router.route(event)
+
+    async def dispatch_messaging_event(self, event: Any) -> int:
+        """Fan out an inbound event using only active-profile host grants.
+
+        Plugin declarations never grant authority.  Loading through the normal
+        config API keeps multiplexed/profile-scoped gateway calls in their
+        current Hermes home; malformed or absent configuration stays deny-all.
+        """
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+
+        if not self._messaging_router.has_subscriptions:
+            return 0
+        self._messaging_router.set_permissions(
+            HostMessagingPermissions.from_raw(load_config_readonly())
+        )
+        return await self._messaging_router.dispatch(event)
 
     # -----------------------------------------------------------------------
     # Public
