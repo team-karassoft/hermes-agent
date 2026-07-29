@@ -935,6 +935,10 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    # Profile-scoped exact route grants for the host-owned plugin messaging
+    # boundary. Plugin ids and their inbound/outbound grants are intentionally
+    # open-ended; HostMessagingPermissions validates them deny-by-default.
+    "plugin_messaging": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
