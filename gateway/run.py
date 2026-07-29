@@ -11138,8 +11138,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
             try:
-                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
+                from hermes_cli.lifecycle import invoke_hook_async as _invoke_hook_async
+                _hook_results = await _invoke_hook_async(
                     "pre_gateway_dispatch",
                     event=event,
                     gateway=self,
@@ -11153,13 +11153,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hook_results = []
 
             for _result in _hook_results:
-                if not isinstance(_result, dict):
+                if isinstance(_result, str):
+                    _action = _result
+                elif isinstance(_result, dict):
+                    _action = _result.get("action")
+                else:
                     continue
-                _action = _result.get("action")
-                if _action == "skip":
+                if _action in {"skip", "claim"}:
                     logger.info(
                         "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
+                        _result.get("reason") if isinstance(_result, dict) else None,
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
