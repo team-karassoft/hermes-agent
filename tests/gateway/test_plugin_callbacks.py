@@ -11,6 +11,7 @@ from gateway.plugin_callbacks import (
     CallbackRejected,
     HostCallbackRegistry,
     TrustedCallback,
+    load_or_create_callback_signing_key,
 )
 from gateway.plugin_messaging import (
     Button,
@@ -272,6 +273,40 @@ def test_expired_and_replayed_tokens_are_denied(registry) -> None:
     registry.validate_and_consume(callback)
     with pytest.raises(CallbackRejected, match="replayed"):
         registry.validate_and_consume(callback)
+
+
+def test_callback_token_survives_registry_restart_with_profile_local_key(
+    tmp_path,
+) -> None:
+    key_path = tmp_path / "host-private" / "plugin-callback-signing.key"
+    database_path = tmp_path / "callbacks.db"
+    first_registry = HostCallbackRegistry(
+        signing_key=load_or_create_callback_signing_key(key_path),
+        database_path=database_path,
+        now=lambda: NOW,
+    )
+    token = first_registry.issue(
+        plugin_id="owner",
+        route=ROUTE,
+        action="approve",
+        payload={"proposal_id": "7"},
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    first_registry.bind_message(token=token, message_id="sent-99")
+
+    restarted_registry = HostCallbackRegistry(
+        signing_key=load_or_create_callback_signing_key(key_path),
+        database_path=database_path,
+        now=lambda: NOW,
+    )
+    claim = restarted_registry.validate_and_consume(
+        TrustedCallback(token, ROUTE, "sent-99", None, "event-after-restart", NOW)
+    )
+
+    assert claim.plugin_id == "owner"
+    assert claim.action == "approve"
+    assert claim.payload == {"proposal_id": "7"}
+    assert key_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio

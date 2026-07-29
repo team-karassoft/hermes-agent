@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -14,6 +15,49 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from gateway.plugin_messaging import TopicRoute
+
+
+_CALLBACK_SIGNING_KEY_BYTES = 32
+
+
+def load_or_create_callback_signing_key(
+    path: str | Path,
+) -> bytes:
+    """Load the host-owned callback key, creating it privately on first use.
+
+    The explicit path is also the test seam; the gateway supplies a
+    profile-local host path rather than accepting plugin-controlled input.
+    """
+    key_path = Path(path)
+    key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        fd = os.open(key_path, flags, 0o600)
+    except FileExistsError:
+        key = key_path.read_bytes()
+    else:
+        key = secrets.token_bytes(_CALLBACK_SIGNING_KEY_BYTES)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            key_file = os.fdopen(fd, "wb")
+            fd = -1
+            with key_file:
+                key_file.write(key)
+                key_file.flush()
+                os.fsync(key_file.fileno())
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            key_path.unlink(missing_ok=True)
+            raise
+
+    if len(key) != _CALLBACK_SIGNING_KEY_BYTES:
+        raise ValueError("invalid callback signing key")
+    return key
 
 
 class CallbackRejected(PermissionError):

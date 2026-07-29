@@ -7786,16 +7786,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             manager = get_plugin_manager()
 
-        import secrets
-
         from gateway import delivery_ledger
-        from gateway.plugin_callbacks import HostCallbackRegistry
+        from gateway.plugin_callbacks import (
+            HostCallbackRegistry,
+            load_or_create_callback_signing_key,
+        )
 
+        callback_database_path = delivery_ledger._db_path().with_name(
+            "plugin_callbacks.db"
+        )
         callback_registry = HostCallbackRegistry(
-            signing_key=secrets.token_bytes(32),
-            database_path=delivery_ledger._db_path().with_name(
-                "plugin_callbacks.db"
+            signing_key=load_or_create_callback_signing_key(
+                callback_database_path.with_name(
+                    ".plugin_callback_signing.key"
+                )
             ),
+            database_path=callback_database_path,
         )
         manager.set_plugin_callback_registry(callback_registry)
 
