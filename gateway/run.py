@@ -3366,6 +3366,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        # Plugin Topic jobs are intentionally owned by GatewayRunner rather
+        # than plugins: this host tracks, de-duplicates, cancels, and logs the
+        # bounded asyncio tasks across the gateway lifecycle.
+        from gateway.plugin_jobs import PluginTopicJobScheduler
+        self._plugin_topic_job_scheduler = PluginTopicJobScheduler()
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -9583,6 +9588,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            plugin_job_scheduler = getattr(self, "_plugin_topic_job_scheduler", None)
+            if plugin_job_scheduler is not None:
+                await plugin_job_scheduler.shutdown()
+
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
                 await stop_watchdog()
@@ -10821,6 +10830,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
+            # Keep the hook's pre-auth placement for compatibility, but only
+            # give authorized Telegram Topic events a scoped job signal. The
+            # hook still runs normally for every other inbound event.
+            _plugin_topic_jobs = None
+            _plugin_delivery = None
+            if (
+                self._is_user_authorized(source)
+                and source.platform == Platform.TELEGRAM
+                and source.chat_type == "forum"
+                and source.chat_id
+                and source.thread_id
+            ):
+                try:
+                    from gateway.plugin_delivery import ScopedPluginDelivery
+                    from gateway.plugin_jobs import ScopedPluginTopicJobs
+                    from hermes_cli.plugins import (
+                        get_plugin_topic_jobs,
+                        get_plugin_topic_outbox_dispatchers,
+                    )
+
+                    scheduler = getattr(self, "_plugin_topic_job_scheduler", None)
+                    if scheduler is None:
+                        # Bare-object unit tests and embedders that bypass
+                        # __init__ retain the same host-owned semantics.
+                        from gateway.plugin_jobs import PluginTopicJobScheduler
+                        scheduler = PluginTopicJobScheduler()
+                        self._plugin_topic_job_scheduler = scheduler
+                    _plugin_topic_jobs = ScopedPluginTopicJobs(
+                        inbound_event=event,
+                        authorized=True,
+                        scheduler=scheduler,
+                        registrations=get_plugin_topic_jobs(),
+                    )
+                    _plugin_delivery = ScopedPluginDelivery(
+                        adapter=self._adapter_for_source(source),
+                        inbound_event=event,
+                        authorized=True,
+                        outbox_dispatchers=get_plugin_topic_outbox_dispatchers(),
+                    )
+                except (TypeError, ValueError, PermissionError):
+                    # Non-Topic sources deliberately have no job capability.
+                    pass
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -10828,12 +10879,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event=event,
                     gateway=self,
                     session_store=self.session_store,
+                    plugin_topic_jobs=_plugin_topic_jobs,
+                    plugin_delivery=_plugin_delivery,
                 )
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
             for _result in _hook_results:
+                if _plugin_delivery is not None:
+                    from gateway.plugin_delivery import PluginTopicReply
+                    if isinstance(_result, PluginTopicReply):
+                        try:
+                            await _plugin_delivery._deliver_reply(_result)
+                        except Exception as _delivery_exc:
+                            logger.warning("scoped plugin topic reply failed: %s", _delivery_exc)
+                        return None
                 if not isinstance(_result, dict):
                     continue
                 _action = _result.get("action")

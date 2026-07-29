@@ -170,6 +170,9 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
+    # An authorized Telegram Topic hook may additionally opt into topic_job
+    # (one registered bounded worker) and delivery (exact-topic reply plus its
+    # approved durable outbox); no adapter, sender, target, or command is exposed.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
@@ -1169,8 +1172,88 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
-        self._manager._hooks.setdefault(hook_name, []).append(callback)
+        self._manager._hooks.setdefault(hook_name, []).append(
+            self._bind_gateway_topic_job(hook_name, callback)
+        )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
+
+    def _bind_gateway_topic_job(self, hook_name: str, callback: Callable) -> Callable:
+        """Inject only plugin-bound Topic job and delivery capabilities."""
+        if hook_name != "pre_gateway_dispatch":
+            return callback
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            return callback
+        accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        accepted_names = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        plugin_id = self.manifest.key or self.manifest.name
+
+        def _invoke(**kwargs: Any) -> Any:
+            jobs_root = kwargs.pop("plugin_topic_jobs", None)
+            delivery_root = kwargs.pop("plugin_delivery", None)
+            if jobs_root is not None and (accepts_kwargs or "topic_job" in accepted_names):
+                kwargs["topic_job"] = jobs_root.for_plugin(plugin_id)
+            if delivery_root is not None and (accepts_kwargs or "delivery" in accepted_names):
+                kwargs["delivery"] = delivery_root.for_plugin(plugin_id)
+            if not accepts_kwargs:
+                kwargs = {name: value for name, value in kwargs.items() if name in accepted_names}
+            return callback(**kwargs)
+
+        return _invoke
+
+    def register_topic_job(
+        self,
+        *,
+        name: str,
+        callback: Callable,
+        timeout_seconds: int,
+    ) -> None:
+        """Register this plugin's one bounded, host-scheduled Topic worker.
+
+        The callback receives only an authenticated Topic route. It has no
+        adapter, sender, credentials, command, or arbitrary job target.
+        """
+        from gateway.plugin_jobs import PluginTopicJobRegistration
+
+        plugin_id = self.manifest.key or self.manifest.name
+        if plugin_id in self._manager._plugin_topic_jobs:
+            raise ValueError(f"topic job already registered for {plugin_id}")
+        self._manager._plugin_topic_jobs[plugin_id] = PluginTopicJobRegistration(
+            name=name,
+            callback=callback,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def register_topic_outbox_dispatcher(
+        self,
+        *,
+        approved_routes: list[Any],
+        claim: Callable,
+        mark_delivered: Callable,
+        mark_failed: Callable,
+    ) -> None:
+        """Register this plugin's durable outbox and exact approved Topic routes.
+
+        Gateway delivery claims records through this registration, but plugin
+        hooks receive only a plugin-bound capability: never an adapter,
+        credentials, or an arbitrary target selector.
+        """
+        from gateway.plugin_delivery import validate_outbox_dispatcher
+
+        plugin_id = self.manifest.key or self.manifest.name
+        if plugin_id in self._manager._plugin_topic_outbox_dispatchers:
+            raise ValueError(f"outbox dispatcher already registered for {plugin_id}")
+        self._manager._plugin_topic_outbox_dispatchers[plugin_id] = validate_outbox_dispatcher(
+            approved_routes=approved_routes,
+            claim=claim,
+            mark_delivered=mark_delivered,
+            mark_failed=mark_failed,
+        )
 
     # -- middleware registration -------------------------------------------
 
@@ -1264,6 +1347,12 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        # One bounded worker registration per plugin. GatewayRunner owns every
+        # resulting asyncio task and only exposes a scoped signal capability.
+        self._plugin_topic_jobs: Dict[str, Any] = {}
+        # Durable plugin outboxes are host-dispatched only through exact,
+        # registration-time approved Telegram Topic routes.
+        self._plugin_topic_outbox_dispatchers: Dict[str, Any] = {}
         # Slack Block Kit action handlers registered by plugins. Each entry
         # is (matcher, callback, plugin_name); the Slack adapter wires them
         # into its slack_bolt App at connect() time. ``matcher`` is whatever
@@ -1299,6 +1388,8 @@ class PluginManager:
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
+            self._plugin_topic_jobs.clear()
+            self._plugin_topic_outbox_dispatchers.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
@@ -2052,6 +2143,16 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def get_plugin_topic_jobs() -> Dict[str, Any]:
+    """Return registrations to the host-owned GatewayRunner scheduler only."""
+    return get_plugin_manager()._plugin_topic_jobs
+
+
+def get_plugin_topic_outbox_dispatchers() -> Dict[str, Any]:
+    """Return host-only durable outbox registrations for scoped delivery."""
+    return get_plugin_manager()._plugin_topic_outbox_dispatchers
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
