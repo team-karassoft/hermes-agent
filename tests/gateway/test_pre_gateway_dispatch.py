@@ -65,12 +65,12 @@ async def test_hook_skip_short_circuits_dispatch(monkeypatch):
     """A plugin returning {'action': 'skip'} drops the message before auth."""
     _clear_auth_env(monkeypatch)
 
-    def _fake_hook(name, **kwargs):
+    async def _fake_hook(name, **kwargs):
         if name == "pre_gateway_dispatch":
             return [{"action": "skip", "reason": "plugin-handled"}]
         return []
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_hook)
 
     runner, adapter = _make_runner(Platform.WHATSAPP)
 
@@ -89,7 +89,7 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
 
     seen_text = {}
 
-    def _fake_hook(name, **kwargs):
+    async def _fake_hook(name, **kwargs):
         if name == "pre_gateway_dispatch":
             return [{"action": "rewrite", "text": "REWRITTEN"}]
         return []
@@ -98,7 +98,7 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
         seen_text["value"] = event.text
         return "ok"
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_hook)
 
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner._handle_message_with_agent = _capture  # noqa: SLF001
@@ -115,12 +115,12 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
     # No allowed users set → auth fails → pairing flow triggers.
     monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
 
-    def _fake_hook(name, **kwargs):
+    async def _fake_hook(name, **kwargs):
         if name == "pre_gateway_dispatch":
             return [{"action": "allow"}]
         return []
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_hook)
 
     runner, adapter = _make_runner(Platform.WHATSAPP)
     runner.pairing_store.generate_code.return_value = "12345"
@@ -138,10 +138,10 @@ async def test_hook_exception_does_not_break_dispatch(monkeypatch):
     _clear_auth_env(monkeypatch)
     monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
 
-    def _fake_hook(name, **kwargs):
+    async def _fake_hook(name, **kwargs):
         raise RuntimeError("plugin blew up")
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_hook)
 
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner.pairing_store.generate_code.return_value = None
@@ -159,14 +159,14 @@ async def test_internal_events_bypass_hook(monkeypatch):
 
     called = {"count": 0}
 
-    def _fake_hook(name, **kwargs):
+    async def _fake_hook(name, **kwargs):
         called["count"] += 1
         return [{"action": "skip"}]
 
     async def _capture(event, source, _quick_key, _run_generation):
         return "ok"
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_hook)
 
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner._handle_message_with_agent = _capture  # noqa: SLF001
@@ -193,13 +193,13 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
 
     seen = {}
 
-    def _fake_hook(name, **kwargs):
+    async def _fake_hook(name, **kwargs):
         if name == "pre_gateway_dispatch":
             seen["session_store"] = kwargs.get("session_store", "MISSING")
             return [{"action": "skip", "reason": "plugin-handled"}]
         return []
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", _fake_hook)
 
     runner, adapter = _make_runner(Platform.WHATSAPP)
     del runner.session_store
@@ -209,3 +209,73 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed_action", ["skip", "claim"])
+async def test_loaded_async_legacy_hook_claims_real_telegram_event(
+    monkeypatch, tmp_path, claimed_action
+):
+    """A loaded legacy hook may asynchronously claim a Telegram command.
+
+    This exercises the real PluginManager singleton instead of mocking
+    ``invoke_hook``.  The messaging bus is intentionally left unsubscribed:
+    legacy hooks and new observer/consumer routing are independent contracts.
+    """
+    from hermes_cli import plugins
+
+    hermes_home = tmp_path / "hermes"
+    plugin_dir = hermes_home / "plugins" / "gateway-compat"
+    plugin_dir.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - gateway-compat\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: gateway-compat\nversion: 1.0.0\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        "    async def handle(event, gateway, session_store, **host_metadata):\n"
+        "        gateway.legacy_hook_events.append((event, host_metadata))\n"
+        f"        return {claimed_action!r}\n"
+        "    ctx.register_hook('pre_gateway_dispatch', handle)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    manager.discover_and_load()
+
+    runner, adapter = _make_runner(Platform.TELEGRAM)
+    runner.legacy_hook_events = []
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("claimed command reached normal dispatch")
+    )
+    event = MessageEvent(
+        text="/idea",
+        message_id="42",
+        platform_update_id=314,
+        reply_to_message_id="41",
+        reply_to_text="A realistic replied-to idea",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="1001",
+            chat_id="-1002003",
+            user_name="operator",
+            chat_type="forum",
+            thread_id="77",
+        ),
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    assert len(runner.legacy_hook_events) == 1
+    handled_event, host_metadata = runner.legacy_hook_events[0]
+    assert handled_event is event
+    assert host_metadata["telemetry_schema_version"]
+    assert not manager.messaging_router.has_subscriptions
+    adapter.send.assert_not_awaited()
+    runner._run_agent.assert_not_awaited()
