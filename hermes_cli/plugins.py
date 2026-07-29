@@ -1316,13 +1316,22 @@ class PluginManager:
         from gateway.plugin_messaging import PluginMessageRouter
         self._messaging_router = PluginMessageRouter()
         self._plugin_outbound_dispatcher: Optional[Callable[..., None]] = None
+        self._plugin_callback_registry = None
 
     @property
     def messaging_router(self) -> Any:
         """Return the host-owned plugin messaging router."""
         return self._messaging_router
 
-    def enqueue_plugin_text(self, *, plugin_id: str, idempotency_key: str, route: Any, text: str) -> str:
+    def enqueue_plugin_text(
+        self,
+        *,
+        plugin_id: str,
+        idempotency_key: str,
+        route: Any,
+        text: str,
+        keyboard: Any = None,
+    ) -> str:
         """Host validates and durably records a manifest-bound plugin text intent."""
         from gateway.plugin_messaging import HostMessagingPermissions
         from gateway.plugin_outbox import PluginOutboundIntent, PluginOutboxService
@@ -1331,14 +1340,20 @@ class PluginManager:
             idempotency_key=idempotency_key,
             route=route,
             text=text,
+            keyboard=keyboard,
         )
         obligation_id, accepted = PluginOutboxService(
-            HostMessagingPermissions.from_raw(load_config_readonly())
+            HostMessagingPermissions.from_raw(load_config_readonly()),
+            callback_registry=self._plugin_callback_registry,
         ).accept(plugin_id=plugin_id, intent=intent)
         dispatcher = self._plugin_outbound_dispatcher
         if dispatcher is not None and accepted:
             try:
-                dispatcher(obligation_id=obligation_id, intent=intent)
+                dispatcher(
+                    obligation_id=obligation_id,
+                    intent=intent,
+                    plugin_id=plugin_id,
+                )
             except Exception:
                 # The accepted row remains pending for startup ledger recovery.
                 logger.warning(
@@ -1353,6 +1368,21 @@ class PluginManager:
     ) -> None:
         """Bind or remove the active gateway-owned immediate dispatcher."""
         self._plugin_outbound_dispatcher = dispatcher
+
+    def set_plugin_callback_registry(self, registry: Any) -> None:
+        """Install the gateway-owned registry without exposing it to plugins."""
+        self._plugin_callback_registry = registry
+        self._messaging_router.set_callback_registry(registry)
+
+    async def route_plugin_callback(self, callback: Any) -> Any:
+        """Host-only callback entry point after adapter normalization."""
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+
+        self._messaging_router.set_permissions(
+            HostMessagingPermissions.from_raw(load_config_readonly())
+        )
+        return await self._messaging_router.route_callback(callback)
 
     async def route_messaging_event(self, event: Any) -> Any:
         """Return Phase 2 host routing outcome for an authorized inbound event."""

@@ -7786,7 +7786,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             manager = get_plugin_manager()
 
-        def _dispatch(*, obligation_id, intent) -> None:
+        import secrets
+
+        from gateway import delivery_ledger
+        from gateway.plugin_callbacks import HostCallbackRegistry
+
+        callback_registry = HostCallbackRegistry(
+            signing_key=secrets.token_bytes(32),
+            database_path=delivery_ledger._db_path().with_name(
+                "plugin_callbacks.db"
+            ),
+        )
+        manager.set_plugin_callback_registry(callback_registry)
+
+        def _dispatch(*, obligation_id, intent, plugin_id) -> None:
             try:
                 platform = Platform(intent.route.platform)
             except (TypeError, ValueError):
@@ -7802,6 +7815,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                     obligation_id=obligation_id,
                     intent=intent,
+                    plugin_id=plugin_id,
+                    callback_registry=callback_registry,
                 )
             )
             background_tasks = getattr(self, "_background_tasks", None)

@@ -9,10 +9,15 @@ host grants become eligible for observer fan-out.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Literal, Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Mapping
+
+if TYPE_CHECKING:
+    from gateway.plugin_callbacks import HostCallbackRegistry, TrustedCallback
 
 
 EventKind = Literal["message", "callback"]
@@ -50,6 +55,51 @@ class TopicRoute:
 
 
 @dataclass(frozen=True)
+class Button:
+    """Platform-neutral semantic action; raw transport callback data is forbidden."""
+
+    label: str
+    action: str
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("button label is required")
+        if not isinstance(self.action, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_.-]*", self.action
+        ):
+            raise ValueError("button action must be a stable semantic name")
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("button payload must be a mapping")
+        try:
+            normalized = json.loads(
+                json.dumps(
+                    dict(self.payload),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("button payload must be JSON-compatible") from exc
+        object.__setattr__(self, "payload", MappingProxyType(normalized))
+
+
+@dataclass(frozen=True)
+class InlineKeyboard:
+    """Rows of typed semantic buttons."""
+
+    rows: tuple[tuple[Button, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not self.rows or any(
+            not row or any(not isinstance(button, Button) for button in row)
+            for row in self.rows
+        ):
+            raise ValueError("keyboard requires non-empty rows of Button values")
+
+
+@dataclass(frozen=True)
 class PluginMessageEvent:
     """Immutable plugin-facing envelope derived from trusted host input."""
 
@@ -65,6 +115,8 @@ class PluginMessageEvent:
     reply_to_message_id: str | None
     attachments: tuple[AttachmentRef, ...]
     received_at: datetime
+    action: str | None = None
+    payload: Mapping[str, Any] | None = None
 
     @property
     def route(self) -> TopicRoute:
@@ -151,9 +203,15 @@ class _Subscription:
 class HostMessagingPermissions:
     """Deny-by-default inbound grants parsed from profile-scoped host config."""
 
-    def __init__(self, inbound: Mapping[str, frozenset[tuple[TopicRoute, EventKind]]], outbound: Mapping[str, frozenset[TopicRoute]] | None = None) -> None:
+    def __init__(
+        self,
+        inbound: Mapping[str, frozenset[tuple[TopicRoute, EventKind]]],
+        outbound: Mapping[str, frozenset[TopicRoute]] | None = None,
+        outbound_keyboard: Mapping[str, frozenset[TopicRoute]] | None = None,
+    ) -> None:
         self._inbound = dict(inbound)
         self._outbound = dict(outbound or {})
+        self._outbound_keyboard = dict(outbound_keyboard or {})
 
     @classmethod
     def empty(cls) -> "HostMessagingPermissions":
@@ -166,6 +224,7 @@ class HostMessagingPermissions:
             return cls.empty()
         grants: dict[str, frozenset[tuple[TopicRoute, EventKind]]] = {}
         outbound_grants: dict[str, frozenset[TopicRoute]] = {}
+        keyboard_grants: dict[str, frozenset[TopicRoute]] = {}
         for plugin_id, plugin_config in root.items():
             if not isinstance(plugin_id, str) or not isinstance(plugin_config, Mapping):
                 continue
@@ -192,19 +251,30 @@ class HostMessagingPermissions:
                         allowed.add((route, event_type))
             grants[plugin_id] = frozenset(allowed)
             allowed_outbound: set[TopicRoute] = set()
+            allowed_keyboard: set[TopicRoute] = set()
             for item in plugin_config.get("outbound", ()) if isinstance(plugin_config.get("outbound", ()), list) else ():
-                if not isinstance(item, Mapping) or "text" not in item.get("types", ()): continue
+                if not isinstance(item, Mapping):
+                    continue
                 try:
-                    allowed_outbound.add(TopicRoute(str(item["platform"]).strip().lower(), str(item["chat_id"]), str(item["thread_id"]) if item.get("thread_id") is not None else None))
+                    route = TopicRoute(str(item["platform"]).strip().lower(), str(item["chat_id"]), str(item["thread_id"]) if item.get("thread_id") is not None else None)
                 except (KeyError, SubscriptionError):
                     continue
+                types = item.get("types", ())
+                if "text" in types:
+                    allowed_outbound.add(route)
+                if "inline_keyboard" in types:
+                    allowed_keyboard.add(route)
             outbound_grants[plugin_id] = frozenset(allowed_outbound)
-        return cls(grants, outbound_grants)
+            keyboard_grants[plugin_id] = frozenset(allowed_keyboard)
+        return cls(grants, outbound_grants, keyboard_grants)
 
     def allows(self, plugin_id: str, route: TopicRoute, event_type: EventKind) -> bool:
         return (route, event_type) in self._inbound.get(plugin_id, frozenset())
     def allows_outbound_text(self, plugin_id: str, route: TopicRoute) -> bool:
         return route in self._outbound.get(plugin_id, frozenset())
+
+    def allows_outbound_keyboard(self, plugin_id: str, route: TopicRoute) -> bool:
+        return route in self._outbound_keyboard.get(plugin_id, frozenset())
 
 
 class PluginMessagingService:
@@ -236,11 +306,23 @@ class PluginMessagingService:
             consumer=consumer,
         )
 
-    def enqueue_text(self, *, idempotency_key: str, route: TopicRoute, text: str) -> str:
+    def enqueue_text(
+        self,
+        *,
+        idempotency_key: str,
+        route: TopicRoute,
+        text: str,
+        keyboard: InlineKeyboard | None = None,
+    ) -> str:
         """Request a durable host-validated text delivery; no adapter is exposed."""
         if self._enqueue_text is None:
             raise PermissionError("plugin outbound messaging is unavailable")
-        return self._enqueue_text(idempotency_key=idempotency_key, route=route, text=text)
+        return self._enqueue_text(
+            idempotency_key=idempotency_key,
+            route=route,
+            text=text,
+            keyboard=keyboard,
+        )
 
 
 @dataclass(frozen=True)
@@ -256,9 +338,15 @@ class MessagingDispatchOutcome:
 class PluginMessageRouter:
     """Host-owned observer fan-out and deterministic Phase 2 consumer router."""
 
-    def __init__(self, permissions: HostMessagingPermissions | None = None) -> None:
+    def __init__(
+        self,
+        permissions: HostMessagingPermissions | None = None,
+        *,
+        callback_registry: "HostCallbackRegistry | None" = None,
+    ) -> None:
         self._permissions = permissions or HostMessagingPermissions.empty()
         self._subscriptions: dict[tuple[str, str], _Subscription] = {}
+        self._callback_registry = callback_registry
 
     @property
     def has_subscriptions(self) -> bool:
@@ -267,6 +355,12 @@ class PluginMessageRouter:
 
     def set_permissions(self, permissions: HostMessagingPermissions) -> None:
         self._permissions = permissions
+
+    def set_callback_registry(
+        self, callback_registry: "HostCallbackRegistry | None"
+    ) -> None:
+        """Host integration seam; never exposed through PluginMessagingService."""
+        self._callback_registry = callback_registry
 
     def subscribe(
         self,
@@ -363,6 +457,83 @@ class PluginMessageRouter:
         if action not in {"allow", "claim", "reject"}:
             return MessagingDispatchOutcome(delivered, "error", consumer_plugin_id=winner.plugin_id, audit_reason="invalid-consumer-outcome")
         return MessagingDispatchOutcome(delivered, action, consumer_plugin_id=winner.plugin_id)
+
+    async def route_callback(
+        self, callback: "TrustedCallback"
+    ) -> MessagingDispatchOutcome:
+        """Validate and consume a host callback, then invoke only its owner."""
+        if self._callback_registry is None:
+            return MessagingDispatchOutcome(
+                0, "reject", audit_reason="callback-validation-unavailable"
+            )
+        from gateway.plugin_callbacks import CallbackRejected
+
+        try:
+            claim = self._callback_registry.validate_and_consume(callback)
+        except CallbackRejected:
+            return MessagingDispatchOutcome(
+                0, "reject", audit_reason="callback-validation-rejected"
+            )
+        candidates = [
+            subscription
+            for subscription in self._eligible(
+                PluginMessageEvent(
+                    event_id=claim.event_id,
+                    platform=claim.route.platform,
+                    chat_id=claim.route.chat_id,
+                    thread_id=claim.route.thread_id,
+                    message_id=claim.message_id,
+                    sender_id=claim.sender_id,
+                    chat_type=None,
+                    kind="callback",
+                    text=None,
+                    reply_to_message_id=None,
+                    attachments=(),
+                    received_at=claim.received_at,
+                    action=claim.action,
+                    payload=claim.payload,
+                ),
+                "consumer",
+            )
+            if subscription.plugin_id == claim.plugin_id
+            and subscription.consumer is not None
+            and subscription.consumer.callback_ownership is not None
+        ]
+        if len(candidates) != 1:
+            return MessagingDispatchOutcome(
+                0, "reject", audit_reason="callback-owner-unavailable"
+            )
+        winner = candidates[0]
+        envelope = PluginMessageEvent(
+            event_id=claim.event_id,
+            platform=claim.route.platform,
+            chat_id=claim.route.chat_id,
+            thread_id=claim.route.thread_id,
+            message_id=claim.message_id,
+            sender_id=claim.sender_id,
+            chat_type=None,
+            kind="callback",
+            text=None,
+            reply_to_message_id=None,
+            attachments=(),
+            received_at=claim.received_at,
+            action=claim.action,
+            payload=claim.payload,
+        )
+        try:
+            result = winner.handler(envelope)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:
+            return MessagingDispatchOutcome(
+                0, "error", winner.plugin_id, "consumer-error"
+            )
+        action = result.get("action") if isinstance(result, Mapping) else result
+        if action not in {"allow", "claim", "reject"}:
+            return MessagingDispatchOutcome(
+                0, "error", winner.plugin_id, "invalid-consumer-outcome"
+            )
+        return MessagingDispatchOutcome(0, action, winner.plugin_id)
 
     async def dispatch(self, event: Any) -> int:
         """Phase 1 compatibility facade returning observer delivery count only."""
