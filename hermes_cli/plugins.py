@@ -1318,6 +1318,15 @@ class PluginManager:
         """Return the host-owned plugin messaging router."""
         return self._messaging_router
 
+    async def route_messaging_event(self, event: Any) -> Any:
+        """Return Phase 2 host routing outcome for an authorized inbound event."""
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+        if not self._messaging_router.has_subscriptions:
+            return None
+        self._messaging_router.set_permissions(HostMessagingPermissions.from_raw(load_config_readonly()))
+        return await self._messaging_router.route(event)
+
     async def dispatch_messaging_event(self, event: Any) -> int:
         """Fan out an inbound event using only active-profile host grants.
 

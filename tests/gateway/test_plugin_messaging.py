@@ -288,13 +288,50 @@ def test_consumer_requires_a_valid_namespace_declaration() -> None:
             handler=handler,
         )
 
-    with pytest.raises(SubscriptionError, match="command namespace"):
+
+
+@pytest.mark.asyncio
+async def test_consumer_priority_claims_after_observers() -> None:
+    observed: list[str] = []
+    called: list[str] = []
+    router = PluginMessageRouter(_permissions("observer", "low", "high"))
+    router.subscribe(plugin_id="observer", subscription_id="audit", routes=[APPROVED_TOPIC], event_types={"message"}, mode="observer", handler=lambda event: observed.append(event.text or ""))
+    for plugin_id, priority in (("low", 1), ("high", 10)):
         router.subscribe(
-            plugin_id="consumer",
-            subscription_id="invalid-declaration",
-            routes=[APPROVED_TOPIC],
-            event_types={"message"},
-            mode="consumer",
-            handler=handler,
-            consumer=ConsumerDeclaration(command_namespace="not/a-command"),
+            plugin_id=plugin_id, subscription_id="consume", routes=[APPROVED_TOPIC], event_types={"message"}, mode="consumer",
+            handler=lambda event, p=plugin_id: (called.append(p) or {"action": "claim"}),
+            consumer=ConsumerDeclaration(command_namespace="idea", priority=priority),
         )
+    event = _trusted_event()
+    event.text = "/idea"
+    outcome = await router.route(event)
+    assert outcome.action == "claim"
+    assert outcome.consumer_plugin_id == "high"
+    assert observed == ["/idea"]
+    assert called == ["high"]
+
+
+@pytest.mark.asyncio
+async def test_equal_priority_conflict_and_consumer_error_fail_open() -> None:
+    router = PluginMessageRouter(_permissions("one", "two"))
+    for plugin_id in ("one", "two"):
+        router.subscribe(
+            plugin_id=plugin_id, subscription_id="consume", routes=[APPROVED_TOPIC], event_types={"message"}, mode="consumer",
+            handler=lambda event: {"action": "claim"}, consumer=ConsumerDeclaration(command_namespace="idea", priority=1),
+        )
+    event = _trusted_event(); event.text = "/idea"
+    assert (await router.route(event)).action == "conflict"
+
+    broken = PluginMessageRouter(_permissions("broken"))
+    def _raise(event): raise RuntimeError("no leak")
+    broken.subscribe(plugin_id="broken", subscription_id="consume", routes=[APPROVED_TOPIC], event_types={"message"}, mode="consumer", handler=_raise, consumer=ConsumerDeclaration(command_namespace="idea"))
+    assert (await broken.route(event)).action == "error"
+
+
+@pytest.mark.asyncio
+async def test_consumer_allow_and_reject_never_claim() -> None:
+    for action in ("allow", "reject"):
+        router = PluginMessageRouter(_permissions("consumer"))
+        router.subscribe(plugin_id="consumer", subscription_id=action, routes=[APPROVED_TOPIC], event_types={"message"}, mode="consumer", handler=lambda event, a=action: {"action": a}, consumer=ConsumerDeclaration(command_namespace="idea"))
+        event = _trusted_event(); event.text = "/idea"
+        assert (await router.route(event)).action == action

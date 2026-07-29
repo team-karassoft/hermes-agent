@@ -11161,16 +11161,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        # Phase 1 plugin messaging observers run only after normal gateway
-        # authorization. They receive a frozen envelope derived from the trusted
-        # source, and are strictly observational: a bad observer cannot alter
-        # legacy pre_gateway_dispatch decisions or normal agent dispatch.
+        # Phase 2 observers fan out after authorization. Only a valid host-routed
+        # consumer claim suppresses normal agent dispatch; conflicts/errors fail open.
         if not is_internal:
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
-                await _get_plugin_manager().dispatch_messaging_event(event)
+                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+                if _messaging_outcome is not None and _messaging_outcome.action == "claim":
+                    logger.info("plugin messaging consumer claimed event: plugin=%s", _messaging_outcome.consumer_plugin_id)
+                    return None
             except Exception as _messaging_exc:
-                logger.warning("plugin messaging observer dispatch failed: %s", _messaging_exc)
+                logger.warning("plugin messaging dispatch failed: %s", _messaging_exc)
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

@@ -121,10 +121,11 @@ class PluginMessageEvent:
 
 @dataclass(frozen=True)
 class ConsumerDeclaration:
-    """A Phase 1 consumer claim declaration, validated but not dispatched."""
+    """A named Phase 2 consumer claim declaration."""
 
     command_namespace: str | None = None
     callback_ownership: str | None = None
+    priority: int = 0
 
     def __post_init__(self) -> None:
         declared = [value for value in (self.command_namespace, self.callback_ownership) if value is not None]
@@ -223,8 +224,18 @@ class PluginMessagingService:
         )
 
 
+@dataclass(frozen=True)
+class MessagingDispatchOutcome:
+    """Host-owned Phase 2 routing result; only ``claim`` suppresses the agent."""
+
+    observer_deliveries: int
+    action: Literal["allow", "claim", "reject", "conflict", "error"]
+    consumer_plugin_id: str | None = None
+    audit_reason: str | None = None
+
+
 class PluginMessageRouter:
-    """Host-owned observer router.  Consumers are registered but inert in v1."""
+    """Host-owned observer fan-out and deterministic Phase 2 consumer router."""
 
     def __init__(self, permissions: HostMessagingPermissions | None = None) -> None:
         self._permissions = permissions or HostMessagingPermissions.empty()
@@ -280,18 +291,60 @@ class PluginMessageRouter:
             consumer=consumer,
         )
 
-    async def dispatch(self, event: Any) -> int:
+    def _eligible(self, envelope: PluginMessageEvent, mode: SubscriptionMode) -> list[_Subscription]:
+        return [
+            subscription for subscription in self._subscriptions.values()
+            if subscription.mode == mode
+            and envelope.route in subscription.routes
+            and envelope.kind in subscription.event_types
+            and self._permissions.allows(subscription.plugin_id, envelope.route, envelope.kind)
+        ]
+
+    @staticmethod
+    def _command_matches(envelope: PluginMessageEvent, declaration: ConsumerDeclaration) -> bool:
+        if declaration.command_namespace is not None:
+            text = (envelope.text or "").strip()
+            command = text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
+            return command == declaration.command_namespace
+        # Callback transport is deferred; a future adapter must create kind=callback.
+        return envelope.kind == "callback" and declaration.callback_ownership is not None
+
+    async def route(self, event: Any) -> MessagingDispatchOutcome:
+        """Fan out observers, then permit at most one exact authorized consumer claim."""
         envelope = event if isinstance(event, PluginMessageEvent) else PluginMessageEvent.from_message_event(event)
         delivered = 0
-        for subscription in self._subscriptions.values():
-            if subscription.mode != "observer":
+        for subscription in self._eligible(envelope, "observer"):
+            try:
+                result = subscription.handler(envelope)
+                if inspect.isawaitable(result):
+                    await result
+                delivered += 1
+            except Exception:
+                # Observer failures are isolated; they cannot affect the agent or consumers.
                 continue
-            if envelope.route not in subscription.routes or envelope.kind not in subscription.event_types:
-                continue
-            if not self._permissions.allows(subscription.plugin_id, envelope.route, envelope.kind):
-                continue
-            result = subscription.handler(envelope)
+
+        candidates = [
+            subscription for subscription in self._eligible(envelope, "consumer")
+            if subscription.consumer is not None and self._command_matches(envelope, subscription.consumer)
+        ]
+        if not candidates:
+            return MessagingDispatchOutcome(delivered, "allow")
+        highest = max(subscription.consumer.priority for subscription in candidates if subscription.consumer is not None)
+        winners = [s for s in candidates if s.consumer is not None and s.consumer.priority == highest]
+        if len(winners) != 1:
+            return MessagingDispatchOutcome(delivered, "conflict", audit_reason="consumer-priority-conflict")
+        winner = winners[0]
+        try:
+            result = winner.handler(envelope)
             if inspect.isawaitable(result):
-                await result
-            delivered += 1
-        return delivered
+                result = await result
+        except Exception:
+            return MessagingDispatchOutcome(delivered, "error", consumer_plugin_id=winner.plugin_id, audit_reason="consumer-error")
+        action = result.get("action") if isinstance(result, Mapping) else result
+        if action not in {"allow", "claim", "reject"}:
+            return MessagingDispatchOutcome(delivered, "error", consumer_plugin_id=winner.plugin_id, audit_reason="invalid-consumer-outcome")
+        return MessagingDispatchOutcome(delivered, action, consumer_plugin_id=winner.plugin_id)
+
+    async def dispatch(self, event: Any) -> int:
+        """Phase 1 compatibility facade returning observer delivery count only."""
+        return (await self.route(event)).observer_deliveries
