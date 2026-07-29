@@ -7779,6 +7779,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    def _bind_plugin_messaging_dispatcher(self, manager=None) -> None:
+        """Route accepted plugin intents through gateway-owned tracked tasks."""
+        if manager is None:
+            from hermes_cli.plugins import get_plugin_manager
+
+            manager = get_plugin_manager()
+
+        def _dispatch(*, obligation_id, intent) -> None:
+            try:
+                platform = Platform(intent.route.platform)
+            except (TypeError, ValueError):
+                return
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                return
+
+            from gateway.plugin_outbox import PluginOutboxService
+
+            task = asyncio.create_task(
+                PluginOutboxService.deliver_persisted(
+                    adapter=adapter,
+                    obligation_id=obligation_id,
+                    intent=intent,
+                )
+            )
+            background_tasks = getattr(self, "_background_tasks", None)
+            if not isinstance(background_tasks, set):
+                background_tasks = set()
+                self._background_tasks = background_tasks
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
+        manager.set_plugin_outbound_dispatcher(_dispatch)
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -8645,6 +8679,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        self._bind_plugin_messaging_dispatcher()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -9701,6 +9736,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         async def _stop_impl() -> None:
+            try:
+                from hermes_cli.plugins import get_plugin_manager
+
+                get_plugin_manager().set_plugin_outbound_dispatcher(None)
+            except Exception:
+                logger.debug(
+                    "Failed to unbind plugin messaging dispatcher",
+                    exc_info=True,
+                )
+
             def _kill_tool_subprocesses(phase: str) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
 

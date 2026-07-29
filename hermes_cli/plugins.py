@@ -1315,6 +1315,7 @@ class PluginManager:
         # inbound event is checked against profile-scoped host grants.
         from gateway.plugin_messaging import PluginMessageRouter
         self._messaging_router = PluginMessageRouter()
+        self._plugin_outbound_dispatcher: Optional[Callable[..., None]] = None
 
     @property
     def messaging_router(self) -> Any:
@@ -1326,9 +1327,32 @@ class PluginManager:
         from gateway.plugin_messaging import HostMessagingPermissions
         from gateway.plugin_outbox import PluginOutboundIntent, PluginOutboxService
         from hermes_cli.config import load_config_readonly
-        return PluginOutboxService(HostMessagingPermissions.from_raw(load_config_readonly())).enqueue(
-            plugin_id=plugin_id, intent=PluginOutboundIntent(idempotency_key=idempotency_key, route=route, text=text)
+        intent = PluginOutboundIntent(
+            idempotency_key=idempotency_key,
+            route=route,
+            text=text,
         )
+        obligation_id, accepted = PluginOutboxService(
+            HostMessagingPermissions.from_raw(load_config_readonly())
+        ).accept(plugin_id=plugin_id, intent=intent)
+        dispatcher = self._plugin_outbound_dispatcher
+        if dispatcher is not None and accepted:
+            try:
+                dispatcher(obligation_id=obligation_id, intent=intent)
+            except Exception:
+                # The accepted row remains pending for startup ledger recovery.
+                logger.warning(
+                    "Could not schedule immediate plugin delivery %s",
+                    obligation_id,
+                    exc_info=True,
+                )
+        return obligation_id
+
+    def set_plugin_outbound_dispatcher(
+        self, dispatcher: Optional[Callable[..., None]]
+    ) -> None:
+        """Bind or remove the active gateway-owned immediate dispatcher."""
+        self._plugin_outbound_dispatcher = dispatcher
 
     async def route_messaging_event(self, event: Any) -> Any:
         """Return Phase 2 host routing outcome for an authorized inbound event."""

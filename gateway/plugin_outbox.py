@@ -35,6 +35,13 @@ class PluginOutboxService:
         self._permissions = permissions
 
     def enqueue(self, *, plugin_id: str, intent: PluginOutboundIntent) -> str:
+        obligation_id, _ = self.accept(plugin_id=plugin_id, intent=intent)
+        return obligation_id
+
+    def accept(
+        self, *, plugin_id: str, intent: PluginOutboundIntent
+    ) -> tuple[str, bool]:
+        """Persist once and report whether this call accepted a new obligation."""
         if not self._permissions.allows_outbound_text(plugin_id, intent.route):
             raise OutboundPermissionError("plugin has no outbound text grant for route")
         obligation_id = compute_obligation_id(
@@ -42,19 +49,34 @@ class PluginOutboxService:
             intent.idempotency_key,
             intent.text,
         )
-        record_obligation(
+        inserted = record_obligation(
             obligation_id=obligation_id,
             session_key=f"plugin:{plugin_id}:{intent.route.platform}:{intent.route.chat_id}:{intent.route.thread_id or ''}",
             platform=intent.route.platform,
             chat_id=intent.route.chat_id,
             thread_id=intent.route.thread_id,
             content=intent.text,
+            replace_existing=False,
         )
-        return obligation_id
+        return obligation_id, inserted
 
     async def deliver(self, *, adapter, plugin_id: str, intent: PluginOutboundIntent) -> bool:
         """Host-only immediate delivery; callers supply the gateway-selected adapter."""
         obligation_id = self.enqueue(plugin_id=plugin_id, intent=intent)
+        return await self.deliver_persisted(
+            adapter=adapter,
+            obligation_id=obligation_id,
+            intent=intent,
+        )
+
+    @staticmethod
+    async def deliver_persisted(
+        *,
+        adapter,
+        obligation_id: str,
+        intent: PluginOutboundIntent,
+    ) -> bool:
+        """Settle an already-accepted intent through a host-selected adapter."""
         mark_attempting(obligation_id)
         try:
             result = await adapter.send(chat_id=intent.route.chat_id, content=intent.text, reply_to=None, metadata={"thread_id": intent.route.thread_id})
