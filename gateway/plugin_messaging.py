@@ -151,8 +151,9 @@ class _Subscription:
 class HostMessagingPermissions:
     """Deny-by-default inbound grants parsed from profile-scoped host config."""
 
-    def __init__(self, inbound: Mapping[str, frozenset[tuple[TopicRoute, EventKind]]]) -> None:
+    def __init__(self, inbound: Mapping[str, frozenset[tuple[TopicRoute, EventKind]]], outbound: Mapping[str, frozenset[TopicRoute]] | None = None) -> None:
         self._inbound = dict(inbound)
+        self._outbound = dict(outbound or {})
 
     @classmethod
     def empty(cls) -> "HostMessagingPermissions":
@@ -164,12 +165,13 @@ class HostMessagingPermissions:
         if not isinstance(root, Mapping):
             return cls.empty()
         grants: dict[str, frozenset[tuple[TopicRoute, EventKind]]] = {}
+        outbound_grants: dict[str, frozenset[TopicRoute]] = {}
         for plugin_id, plugin_config in root.items():
             if not isinstance(plugin_id, str) or not isinstance(plugin_config, Mapping):
                 continue
             inbound = plugin_config.get("inbound", ())
             if not isinstance(inbound, list):
-                continue
+                inbound = []
             allowed: set[tuple[TopicRoute, EventKind]] = set()
             for item in inbound:
                 if not isinstance(item, Mapping):
@@ -189,18 +191,29 @@ class HostMessagingPermissions:
                     if event_type in {"message", "callback"}:
                         allowed.add((route, event_type))
             grants[plugin_id] = frozenset(allowed)
-        return cls(grants)
+            allowed_outbound: set[TopicRoute] = set()
+            for item in plugin_config.get("outbound", ()) if isinstance(plugin_config.get("outbound", ()), list) else ():
+                if not isinstance(item, Mapping) or "text" not in item.get("types", ()): continue
+                try:
+                    allowed_outbound.add(TopicRoute(str(item["platform"]).strip().lower(), str(item["chat_id"]), str(item["thread_id"]) if item.get("thread_id") is not None else None))
+                except (KeyError, SubscriptionError):
+                    continue
+            outbound_grants[plugin_id] = frozenset(allowed_outbound)
+        return cls(grants, outbound_grants)
 
     def allows(self, plugin_id: str, route: TopicRoute, event_type: EventKind) -> bool:
         return (route, event_type) in self._inbound.get(plugin_id, frozenset())
+    def allows_outbound_text(self, plugin_id: str, route: TopicRoute) -> bool:
+        return route in self._outbound.get(plugin_id, frozenset())
 
 
 class PluginMessagingService:
     """PluginContext facade that binds registrations to manifest identity."""
 
-    def __init__(self, *, plugin_id: str, router: PluginMessageRouter) -> None:
+    def __init__(self, *, plugin_id: str, router: PluginMessageRouter, enqueue_text: Callable[..., str] | None = None) -> None:
         self._plugin_id = plugin_id
         self._router = router
+        self._enqueue_text = enqueue_text
 
     def subscribe(
         self,
@@ -222,6 +235,12 @@ class PluginMessagingService:
             handler=handler,
             consumer=consumer,
         )
+
+    def enqueue_text(self, *, idempotency_key: str, route: TopicRoute, text: str) -> str:
+        """Request a durable host-validated text delivery; no adapter is exposed."""
+        if self._enqueue_text is None:
+            raise PermissionError("plugin outbound messaging is unavailable")
+        return self._enqueue_text(idempotency_key=idempotency_key, route=route, text=text)
 
 
 @dataclass(frozen=True)

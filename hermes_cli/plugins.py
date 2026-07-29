@@ -361,6 +361,9 @@ class PluginContext:
             self._messaging = PluginMessagingService(
                 plugin_id=self.manifest.key or self.manifest.name,
                 router=self._manager.messaging_router,
+                enqueue_text=lambda **kwargs: self._manager.enqueue_plugin_text(
+                    plugin_id=self.manifest.key or self.manifest.name, **kwargs
+                ),
             )
         return self._messaging
 
@@ -1317,6 +1320,15 @@ class PluginManager:
     def messaging_router(self) -> Any:
         """Return the host-owned plugin messaging router."""
         return self._messaging_router
+
+    def enqueue_plugin_text(self, *, plugin_id: str, idempotency_key: str, route: Any, text: str) -> str:
+        """Host validates and durably records a manifest-bound plugin text intent."""
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from gateway.plugin_outbox import PluginOutboundIntent, PluginOutboxService
+        from hermes_cli.config import load_config_readonly
+        return PluginOutboxService(HostMessagingPermissions.from_raw(load_config_readonly())).enqueue(
+            plugin_id=plugin_id, intent=PluginOutboundIntent(idempotency_key=idempotency_key, route=route, text=text)
+        )
 
     async def route_messaging_event(self, event: Any) -> Any:
         """Return Phase 2 host routing outcome for an authorized inbound event."""
