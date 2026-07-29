@@ -345,6 +345,24 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._messaging: Any = None
+
+    @property
+    def messaging(self) -> Any:
+        """Return the plugin-safe declarative inbound messaging facade.
+
+        Subscriptions are requests only.  The host checks profile-scoped grants
+        at dispatch time, so this facade never exposes a platform adapter,
+        credentials, sender, or a caller-provided plugin identity.
+        """
+        if self._messaging is None:
+            from gateway.plugin_messaging import PluginMessagingService
+
+            self._messaging = PluginMessagingService(
+                plugin_id=self.manifest.key or self.manifest.name,
+                router=self._manager.messaging_router,
+            )
+        return self._messaging
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -1290,6 +1308,32 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Phase 1 message subscriptions are host-owned and inert until an
+        # inbound event is checked against profile-scoped host grants.
+        from gateway.plugin_messaging import PluginMessageRouter
+        self._messaging_router = PluginMessageRouter()
+
+    @property
+    def messaging_router(self) -> Any:
+        """Return the host-owned plugin messaging router."""
+        return self._messaging_router
+
+    async def dispatch_messaging_event(self, event: Any) -> int:
+        """Fan out an inbound event using only active-profile host grants.
+
+        Plugin declarations never grant authority.  Loading through the normal
+        config API keeps multiplexed/profile-scoped gateway calls in their
+        current Hermes home; malformed or absent configuration stays deny-all.
+        """
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+
+        if not self._messaging_router.has_subscriptions:
+            return 0
+        self._messaging_router.set_permissions(
+            HostMessagingPermissions.from_raw(load_config_readonly())
+        )
+        return await self._messaging_router.dispatch(event)
 
     # -----------------------------------------------------------------------
     # Public
