@@ -9096,6 +9096,9 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "server_actions",
     "secrets",
     "goals",
+    # Profile-owned plugin ids and their exact inbound/outbound route grants.
+    # The host parser validates this open-ended section deny-by-default.
+    "plugin_messaging",
 })
 
 # Top-level keys whose sub-keys are partially schema-defined (e.g. on a

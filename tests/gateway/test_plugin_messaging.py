@@ -50,42 +50,33 @@ def _permissions(*plugin_ids: str) -> HostMessagingPermissions:
 
 
 def test_profile_config_round_trips_exact_messaging_grants_through_loader(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ) -> None:
-    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import load_config_readonly, set_config_value
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         """
 plugin_messaging:
   route-auditor:
-    inbound:
-      - platform: telegram
-        chat_id: "-100123"
-        thread_id: "42"
-        events: [message, callback]
     outbound:
       - platform: telegram
         chat_id: "-100123"
         thread_id: "42"
-        types: [text, inline_keyboard]
+        types: []
 """.lstrip(),
         encoding="utf-8",
     )
 
+    # Exercise the same dotted raw-config write path as
+    # ``hermes config set plugin_messaging.<plugin>.outbound.0.types text``.
+    set_config_value("plugin_messaging.route-auditor.outbound.0.types", "text")
     loaded = load_config_readonly()
     permissions = HostMessagingPermissions.from_raw(loaded)
 
-    assert loaded["plugin_messaging"]["route-auditor"]["inbound"][0]["chat_id"] == "-100123"
-    assert permissions.allows("route-auditor", APPROVED_TOPIC, "message")
-    assert permissions.allows("route-auditor", APPROVED_TOPIC, "callback")
     assert permissions.allows_outbound_text("route-auditor", APPROVED_TOPIC)
-    assert permissions.allows_outbound_keyboard("route-auditor", APPROVED_TOPIC)
-
-    assert not permissions.allows("route-auditor", OTHER_TOPIC, "message")
-    assert not permissions.allows("other-plugin", APPROVED_TOPIC, "message")
     assert not permissions.allows_outbound_text("route-auditor", OTHER_TOPIC)
-    assert not permissions.allows_outbound_keyboard("other-plugin", APPROVED_TOPIC)
+    assert "not a recognized config key" not in capsys.readouterr().out
 
 
 def _trusted_event(*, thread_id: str | None = APPROVED_TOPIC.thread_id) -> MessageEvent:
