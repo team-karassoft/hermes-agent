@@ -5095,14 +5095,12 @@ def _set_nested(config, dotted_key: str, value):
       _set_nested(c, "a.0.b", 1)     → c["a"][0]["b"] = 1
       _set_nested(c, "providers.1", "x") → c["providers"][1] = "x"
 
-    Intermediate dicts are created on demand.  List indices are parsed
-    from numeric path segments; the referenced index must already exist
-    (we do not grow lists — the user is navigating into structure they
-    wrote themselves).  If a segment targets a non-container leaf
-    (scalar), the leaf is replaced with a fresh dict so the write can
-    proceed — this preserves the pre-existing behavior for bare scalar
-    overrides (e.g. setting ``a.b.c`` where ``a.b`` was previously a
-    string).
+    Intermediate containers are created on demand.  A numeric next segment
+    makes the current mapping value a list rather than a mapping, and lists
+    are grown as needed.  Scalars are replaced with the container required
+    by the remaining path.  Existing mapping/list navigation is otherwise
+    preserved, except that a numeric segment necessarily replaces a non-list
+    parent.
 
     Guards against #17876: before this fix the code unconditionally
     replaced any non-dict value (including lists) with ``{}``, silently
@@ -5111,7 +5109,8 @@ def _set_nested(config, dotted_key: str, value):
     """
     parts = dotted_key.split(".")
     current = config
-    for part in parts[:-1]:
+    for position, part in enumerate(parts[:-1]):
+        next_part = parts[position + 1]
         if isinstance(current, list):
             try:
                 idx = int(part)
@@ -5120,11 +5119,24 @@ def _set_nested(config, dotted_key: str, value):
                     f"Cannot navigate into list at key {dotted_key!r}: "
                     f"segment {part!r} is not a numeric index"
                 )
+            if idx < 0:
+                raise IndexError(
+                    f"Cannot create negative list index {idx} at key {dotted_key!r}"
+                )
+            while len(current) <= idx:
+                current.append(None)
+            if next_part.isdigit():
+                if not isinstance(current[idx], list):
+                    current[idx] = []
+            elif not isinstance(current[idx], (dict, list)):
+                current[idx] = {}
             current = current[idx]
         elif isinstance(current, dict):
             existing = current.get(part)
-            # Preserve dicts and lists; replace missing/scalar with a fresh dict.
-            if part not in current or not isinstance(existing, (dict, list)):
+            if next_part.isdigit():
+                if not isinstance(existing, list):
+                    current[part] = []
+            elif not isinstance(existing, (dict, list)):
                 current[part] = {}
             current = current[part]
         else:
@@ -5133,7 +5145,20 @@ def _set_nested(config, dotted_key: str, value):
             )
     last = parts[-1]
     if isinstance(current, list):
-        current[int(last)] = value
+        try:
+            idx = int(last)
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"Cannot navigate into list at key {dotted_key!r}: "
+                f"segment {last!r} is not a numeric index"
+            )
+        if idx < 0:
+            raise IndexError(
+                f"Cannot create negative list index {idx} at key {dotted_key!r}"
+            )
+        while len(current) <= idx:
+            current.append(None)
+        current[idx] = value
     else:
         current[last] = value
 
