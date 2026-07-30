@@ -44,6 +44,17 @@ def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
 
 
+def test_polling_recovery_notifies_delivery_usable_once():
+    adapter = _make_adapter()
+    generation, _ = adapter._begin_polling_generation()
+    adapter._notify_delivery_usable = MagicMock()
+
+    adapter._record_polling_progress(generation)
+    adapter._record_polling_progress(generation)
+
+    adapter._notify_delivery_usable.assert_called_once_with()
+
+
 def _mock_polling_app(*, get_me=None):
     app = MagicMock()
     app.updater = MagicMock()

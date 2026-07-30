@@ -7673,7 +7673,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
-    async def _redeliver_pending_obligations(self) -> int:
+    async def _redeliver_pending_obligations(
+        self, platform: Optional[Platform] = None
+    ) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
 
@@ -7704,7 +7706,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
             _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
+                getattr(p, "value", str(p))
+                for p in self.adapters
+                if platform is None or p == platform
             }
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
@@ -7833,6 +7837,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task.add_done_callback(background_tasks.discard)
 
         manager.set_plugin_outbound_dispatcher(_dispatch)
+
+    async def _handle_adapter_delivery_usable(
+        self, adapter: BasePlatformAdapter
+    ) -> None:
+        """Recover owed output when an adapter's send path becomes usable.
+
+        The ledger sweep still claims only dead-owner rows and applies its
+        attempt cap/stale cutoff.  Scoping to this platform prevents one
+        adapter's health transition from spending another platform's budget.
+        Stored output is sent directly; no agent turn or paid work is rerun.
+        """
+        await self._redeliver_pending_obligations(platform=adapter.platform)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -8460,6 +8476,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            adapter.set_delivery_usable_handler(
+                self._handle_adapter_delivery_usable
+            )
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
@@ -9543,6 +9562,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                    adapter.set_delivery_usable_handler(
+                        self._handle_adapter_delivery_usable
+                    )
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
@@ -9573,6 +9595,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_message=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
+
+                        # Recover stored output before considering rerunning any
+                        # interrupted session work.  The sweep is platform
+                        # scoped and claims only obligations whose original
+                        # process owner is dead.
+                        await self._redeliver_pending_obligations(
+                            platform=platform
+                        )
 
                         # Rebuild channel directory with the new adapter
                         try:
