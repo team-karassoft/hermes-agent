@@ -1130,6 +1130,40 @@ mcp_servers:
 
 Hermes connects to each server at startup, lists its tools, and registers them alongside built-ins. The LLM sees them exactly like any other tool. **Full guide:** [MCP](/user-guide/features/mcp).
 
+### Gateway interval tasks
+
+Plugins that need periodic background work while the messaging gateway is
+running can register an async callback:
+
+```python
+async def refresh_index() -> None:
+    # Keep each pass bounded and yield during I/O.
+    await update_changed_items()
+
+def register(ctx):
+    ctx.register_gateway_interval_task(
+        name="refresh-index",
+        interval_seconds=60,
+        callback=refresh_index,
+    )
+```
+
+The gateway host owns this lifecycle. It namespaces the task as
+`<manifest-key>:<name>`, starts it once only after the event loop and adapters
+are ready, and cancels and awaits it during gateway shutdown. The callback must
+be an `async def`, the interval must be at least 30 seconds, and a task's
+invocations never overlap. If a callback fails, the host logs only the
+namespaced task and failure count (not exception text, which may contain
+secrets), then retries with exponential backoff capped at five minutes. A
+successful pass resets the backoff.
+
+Keep callbacks cooperative: use async I/O, bound every network operation, and
+return after one pass. Do not create a second forever-loop or retain gateway
+adapters; scheduling and shutdown remain host-owned.
+
+This registration is active only in a running gateway process. It does not add
+a model tool, create configuration, or cause a gateway restart.
+
 ### Gateway event hooks — fire on lifecycle events
 
 Drop a manifest + handler into `~/.hermes/hooks/<name>/`:

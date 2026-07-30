@@ -38,7 +38,9 @@ import importlib.metadata
 import importlib.util
 import inspect
 import logging
+import math
 import os
+import re
 import sys
 import threading
 import types
@@ -74,6 +76,15 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+@dataclass(frozen=True)
+class GatewayIntervalTaskRegistration:
+    """A manifest-bound periodic callback owned by the gateway host."""
+
+    name: str
+    interval_seconds: float
+    callback: Callable[[], Any]
 
 
 logger = logging.getLogger(__name__)
@@ -968,6 +979,62 @@ class PluginContext:
 
     # -- platform adapter registration ---------------------------------------
 
+    def register_gateway_interval_task(
+        self,
+        name: str,
+        interval_seconds: float,
+        callback: Callable[[], Any],
+    ) -> None:
+        """Register an async, non-overlapping periodic gateway callback.
+
+        The host prefixes ``name`` with this plugin's manifest identity,
+        starts the task only after gateway startup is complete, and owns
+        cancellation during shutdown. Intervals shorter than 30 seconds are
+        rejected.
+        """
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*", name
+        ):
+            raise ValueError(
+                "gateway interval task name must start with an alphanumeric "
+                "character and contain only letters, numbers, '.', '_' or '-'"
+            )
+        if isinstance(interval_seconds, bool) or not isinstance(
+            interval_seconds, (int, float)
+        ):
+            raise TypeError("gateway interval task interval_seconds must be numeric")
+        if not math.isfinite(interval_seconds) or interval_seconds < 30:
+            raise ValueError(
+                "gateway interval task interval_seconds must be at least 30"
+            )
+        if not inspect.iscoroutinefunction(callback):
+            raise TypeError("gateway interval task callback must be async")
+        try:
+            inspect.signature(callback).bind()
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "gateway interval task callback must accept no arguments"
+            ) from exc
+
+        plugin_id = self.manifest.key or self.manifest.name
+        qualified_name = f"{plugin_id}:{name}"
+        if qualified_name in self._manager._gateway_interval_tasks:
+            raise ValueError(
+                f"gateway interval task {qualified_name!r} is already registered"
+            )
+        self._manager._gateway_interval_tasks[qualified_name] = (
+            GatewayIntervalTaskRegistration(
+                name=qualified_name,
+                interval_seconds=float(interval_seconds),
+                callback=callback,
+            )
+        )
+        logger.debug(
+            "Plugin %s registered gateway interval task: %s",
+            self.manifest.name,
+            qualified_name,
+        )
+
     def register_platform(
         self,
         name: str,
@@ -1294,6 +1361,9 @@ class PluginManager:
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
+        self._gateway_interval_tasks: Dict[
+            str, GatewayIntervalTaskRegistration
+        ] = {}
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
@@ -1374,6 +1444,12 @@ class PluginManager:
         self._plugin_callback_registry = registry
         self._messaging_router.set_callback_registry(registry)
 
+    def get_gateway_interval_tasks(
+        self,
+    ) -> tuple[GatewayIntervalTaskRegistration, ...]:
+        """Return an immutable snapshot of host-owned task declarations."""
+        return tuple(self._gateway_interval_tasks.values())
+
     async def route_plugin_callback(self, callback: Any) -> Any:
         """Host-only callback entry point after adapter normalization."""
         from gateway.plugin_messaging import HostMessagingPermissions
@@ -1433,6 +1509,7 @@ class PluginManager:
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
+            self._gateway_interval_tasks.clear()
             self._cli_commands.clear()
             self._plugin_commands.clear()
             self._plugin_skills.clear()
