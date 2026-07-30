@@ -2087,10 +2087,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if generation != self._polling_generation:
             return
+        was_degraded = self._send_path_degraded
         self._polling_progress_event.set()
         self._polling_network_error_count = 0
         self._polling_conflict_count = 0
         self._send_path_degraded = False
+        if was_degraded:
+            self._notify_delivery_usable()
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.

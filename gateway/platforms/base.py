@@ -2684,6 +2684,13 @@ class BasePlatformAdapter(ABC):
         self._reaction_handler: Optional[
             Callable[[Dict[str, Any]], Awaitable[None]]
         ] = None
+        # Gateway-owned recovery hook invoked when an adapter's outbound path
+        # transitions from degraded/disconnected back to usable.  This is a
+        # lifecycle notification only: the gateway remains the sole owner of
+        # durable delivery-ledger claiming and redelivery.
+        self._delivery_usable_handler: Optional[
+            Callable[["BasePlatformAdapter"], Awaitable[None] | None]
+        ] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -3060,6 +3067,30 @@ class BasePlatformAdapter(ABC):
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
+
+    def set_delivery_usable_handler(
+        self,
+        handler: Optional[
+            Callable[["BasePlatformAdapter"], Awaitable[None] | None]
+        ],
+    ) -> None:
+        self._delivery_usable_handler = handler
+
+    def _notify_delivery_usable(self) -> None:
+        """Notify the gateway after an outbound path becomes usable again."""
+        handler = self._delivery_usable_handler
+        if handler is None:
+            return
+        try:
+            result = handler(self)
+            if inspect.isawaitable(result):
+                task = asyncio.create_task(result)
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.debug(
+                "[%s] delivery-usable handler failed", self.name, exc_info=True
+            )
 
     def _mark_connected(self) -> None:
         self._running = True

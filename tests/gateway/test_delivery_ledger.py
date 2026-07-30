@@ -282,6 +282,90 @@ class TestGatewayRedeliverySweep:
         assert n == 0
         adapter.send.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_failed_plugin_obligation_redelivers_when_adapter_usable(self):
+        """A plugin adapter recovering in-place must trigger the same durable
+        recovery as startup, without recomputing the response."""
+        from gateway.config import Platform
+
+        _record(platform="slack")
+        dl.mark_attempting("ob-1")
+        dl.mark_failed("ob-1", "send_path_degraded")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.platform = Platform.SLACK
+        runner = self._runner(adapter)
+
+        await runner._handle_adapter_delivery_usable(adapter)
+
+        adapter.send.assert_awaited_once()
+        sent = adapter.send.call_args.kwargs["content"]
+        assert sent == dl.RECOVERED_MARKER + "the final answer"
+        assert _row("ob-1")["state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_reconnect_does_not_claim_live_original_owner(self):
+        from gateway.config import Platform
+
+        _record(platform="slack")
+        dl.mark_failed("ob-1", "timeout")
+        adapter = self._adapter()
+        adapter.platform = Platform.SLACK
+        runner = self._runner(adapter)
+
+        await runner._handle_adapter_delivery_usable(adapter)
+
+        adapter.send.assert_not_awaited()
+        assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-1")["attempts"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reconnect_does_not_retry_beyond_attempt_cap(self):
+        from gateway.config import Platform
+
+        _record(platform="slack")
+        dl.mark_failed("ob-1", "timeout")
+        _orphan("ob-1")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
+                (dl.MAX_ATTEMPTS, "ob-1"),
+            )
+        adapter = self._adapter()
+        adapter.platform = Platform.SLACK
+        runner = self._runner(adapter)
+
+        await runner._handle_adapter_delivery_usable(adapter)
+
+        adapter.send.assert_not_awaited()
+        assert _row("ob-1")["state"] == "abandoned"
+        assert _row("ob-1")["attempts"] == dl.MAX_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_reconnect_recovery_isolated_to_usable_platform(self):
+        from gateway.config import Platform
+
+        _record(oid="slack-ob", platform="slack")
+        _record(
+            oid="telegram-ob",
+            session_key="agent:main:telegram:dm:42",
+            platform="telegram",
+            chat_id="42",
+        )
+        for oid in ("slack-ob", "telegram-ob"):
+            dl.mark_failed(oid, "timeout")
+            _orphan(oid)
+        adapter = self._adapter()
+        adapter.platform = Platform.SLACK
+        runner = self._runner(adapter)
+
+        await runner._handle_adapter_delivery_usable(adapter)
+
+        adapter.send.assert_awaited_once()
+        assert _row("slack-ob")["state"] == "delivered"
+        assert _row("telegram-ob")["state"] == "failed"
+        assert _row("telegram-ob")["attempts"] == 0
+
 
 class TestAttemptsOnlySpentOnRealSends:
     """``attempts`` is the redelivery budget — it must buy a send.
