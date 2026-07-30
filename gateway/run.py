@@ -3329,11 +3329,23 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # Max seconds between platform reconnect retries (primary watcher and
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
+_PLUGIN_INTERVAL_BACKOFF_CAP_SECONDS = 300.0
 
 
 def _reconnect_backoff(attempt: int) -> int:
     """Exponential reconnect backoff: 30s, 60s, 120s, ... capped at 5 min."""
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
+
+
+def _plugin_interval_failure_backoff(
+    interval_seconds: float, consecutive_failures: int
+) -> float:
+    """Return bounded retry delay after a plugin interval callback failure."""
+    exponent = max(0, consecutive_failures - 1)
+    return min(
+        interval_seconds * (2 ** min(exponent, 30)),
+        _PLUGIN_INTERVAL_BACKOFF_CAP_SECONDS,
+    )
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -3381,6 +3393,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _shutdown_watchdog_done: Optional["threading.Event"] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
+    _gateway_interval_tasks_started: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3754,6 +3767,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._gateway_interval_task_handles: Dict[str, asyncio.Task] = {}
+        self._gateway_interval_tasks_started = False
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -8748,6 +8763,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
+        self._start_gateway_interval_tasks()
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
@@ -9757,6 +9773,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         watchdog.ready("Hermes Gateway running")
         return True
 
+    def _start_gateway_interval_tasks(self) -> None:
+        """Start each registered plugin interval callback exactly once."""
+        if not self._running or self._gateway_interval_tasks_started:
+            return
+        self._gateway_interval_tasks_started = True
+
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            registrations = get_plugin_manager().get_gateway_interval_tasks()
+        except Exception:
+            logger.warning(
+                "Could not load plugin gateway interval task registrations",
+                exc_info=True,
+            )
+            return
+
+        handles = getattr(self, "_gateway_interval_task_handles", None)
+        if handles is None:
+            handles = {}
+            self._gateway_interval_task_handles = handles
+        for registration in registrations:
+            if registration.name in handles:
+                continue
+            task = asyncio.create_task(
+                self._run_gateway_interval_task(registration),
+                name=f"plugin-interval:{registration.name}",
+            )
+            handles[registration.name] = task
+
+    async def _run_gateway_interval_task(self, registration: Any) -> None:
+        """Run one callback serially, backing off after consecutive failures."""
+        failures = 0
+        delay = registration.interval_seconds
+        try:
+            while self._running:
+                await asyncio.sleep(delay)
+                if not self._running:
+                    return
+                try:
+                    await registration.callback()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failures += 1
+                    delay = _plugin_interval_failure_backoff(
+                        registration.interval_seconds, failures
+                    )
+                    # Deliberately omit exception text/traceback: plugin
+                    # exceptions may contain credentials or request payloads.
+                    logger.warning(
+                        "Plugin gateway interval task %s failed "
+                        "(consecutive_failures=%d, retry_in=%.1fs)",
+                        registration.name,
+                        failures,
+                        delay,
+                    )
+                else:
+                    failures = 0
+                    delay = registration.interval_seconds
+        finally:
+            handles = getattr(self, "_gateway_interval_task_handles", None)
+            current = asyncio.current_task()
+            if handles is not None and handles.get(registration.name) is current:
+                handles.pop(registration.name, None)
+
+    async def _stop_gateway_interval_tasks(self) -> None:
+        """Cancel and await all host-owned plugin interval callbacks."""
+        handles = getattr(self, "_gateway_interval_task_handles", None)
+        if not handles:
+            return
+        tasks = tuple(handles.values())
+        handles.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _stop_systemd_watchdog(self) -> None:
         """Stop heartbeats before any potentially long shutdown drain."""
         watchdog = self._systemd_watchdog
@@ -9919,6 +10012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            await self._stop_gateway_interval_tasks()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
