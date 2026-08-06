@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -273,6 +274,68 @@ def test_expired_and_replayed_tokens_are_denied(registry) -> None:
     registry.validate_and_consume(callback)
     with pytest.raises(CallbackRejected, match="replayed"):
         registry.validate_and_consume(callback)
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_forwards_only_host_validated_plugin_callback(monkeypatch, registry) -> None:
+    """Adapter must pass an opaque token to the host router, never raw payload."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from gateway.config import PlatformConfig
+
+    token = registry.issue(
+        plugin_id="owner", route=ROUTE, action="approve_proposal",
+        payload={"proposal_id": "7"}, expires_at=NOW + timedelta(minutes=5),
+    )
+    registry.bind_message(token=token, message_id="sent-99")
+    router = PluginMessageRouter(_permissions("owner"), callback_registry=registry)
+    received = []
+    router.subscribe(
+        plugin_id="owner", subscription_id="callback", routes=[ROUTE],
+        event_types={"callback"}, mode="consumer",
+        handler=lambda event: received.append(event) or {"action": "claim"},
+        consumer=ConsumerDeclaration(callback_ownership="actions"),
+    )
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test", extra={}))
+    adapter._is_callback_user_authorized = lambda *args, **kwargs: True
+    adapter.set_plugin_callback_router(router)
+    query = type("Query", (), {})()
+    query.data = token
+    query.message = type("Message", (), {"chat_id": -100123, "message_id": "sent-99", "message_thread_id": 42, "chat": type("Chat", (), {"type": "supergroup"})()})()
+    query.from_user = type("User", (), {"id": "actor-1", "first_name": "Owner"})()
+    query.answer = AsyncMock()
+    update = type("Update", (), {"callback_query": query})()
+
+    await adapter._handle_callback_query(update, None)
+
+    assert len(received) == 1
+    assert received[0].action == "approve_proposal"
+    assert received[0].payload == {"proposal_id": "7"}
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_accepts_manager_callback_callable() -> None:
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from gateway.platforms.base import PlatformConfig
+
+    received = []
+
+    async def manager_callback(callback):
+        received.append(callback)
+        return type("Outcome", (), {"action": "claim"})()
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test", extra={}))
+    adapter._is_callback_user_authorized = lambda *args, **kwargs: True
+    adapter.set_plugin_callback_router(manager_callback)
+    query = type("Query", (), {})()
+    query.data = "pc1.opaque.signature"
+    query.message = type("Message", (), {"chat_id": -100123, "message_id": "sent-99", "message_thread_id": 42, "chat": type("Chat", (), {"type": "supergroup"})()})()
+    query.from_user = type("User", (), {"id": "actor-1", "first_name": "Owner"})()
+    query.answer = AsyncMock()
+
+    await adapter._handle_callback_query(type("Update", (), {"callback_query": query})(), None)
+
+    assert len(received) == 1
+    assert received[0].token == "pc1.opaque.signature"
 
 
 def test_callback_token_survives_registry_restart_with_profile_local_key(

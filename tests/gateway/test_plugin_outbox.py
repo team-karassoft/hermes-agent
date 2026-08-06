@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from gateway import delivery_ledger as dl
@@ -94,6 +96,9 @@ class _Adapter:
             raise self.error
         return self.result
 
+    def set_plugin_callback_router(self, router) -> None:
+        self.plugin_callback_router = router
+
 
 def _manager_with_config(monkeypatch):
     from hermes_cli.plugins import PluginManager
@@ -117,6 +122,48 @@ def _manager_with_config(monkeypatch):
         },
     )
     return manager
+
+
+def test_gateway_binds_callback_router_to_capable_adapter(monkeypatch) -> None:
+    from gateway.run import GatewayRunner
+
+    adapter = _Adapter(SendResult(success=True))
+    manager = _manager_with_config(monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._background_tasks = set()
+
+    runner._bind_plugin_messaging_dispatcher(manager)
+
+    assert adapter.plugin_callback_router.__self__ is manager
+    assert adapter.plugin_callback_router.__func__ is manager.route_plugin_callback.__func__
+
+
+@pytest.mark.asyncio
+async def test_gateway_bound_telegram_adapter_invokes_manager_callback(monkeypatch) -> None:
+    from gateway.platforms.base import PlatformConfig
+    from gateway.run import GatewayRunner
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test", extra={}))
+    adapter._is_callback_user_authorized = lambda *args, **kwargs: True
+    manager = _manager_with_config(monkeypatch)
+    manager.route_plugin_callback = AsyncMock(return_value=SimpleNamespace(action="reject"))
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._background_tasks = set()
+
+    runner._bind_plugin_messaging_dispatcher(manager)
+    assert adapter._plugin_callback_router is manager.route_plugin_callback
+    query = SimpleNamespace(
+        data="pc1.opaque.signature",
+        message=SimpleNamespace(chat_id=-100123, message_id="sent-99", message_thread_id=42, chat=SimpleNamespace(type="supergroup")),
+        from_user=SimpleNamespace(id="actor-1", first_name="Owner"),
+        answer=AsyncMock(),
+    )
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    manager.route_plugin_callback.assert_awaited_once()
 
 
 @pytest.mark.asyncio
