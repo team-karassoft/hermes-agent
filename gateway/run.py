@@ -7749,6 +7749,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+            is_plugin_obligation = str(row.get("session_key") or "").startswith("plugin:")
+            if row.get("plugin_intent") is not None or is_plugin_obligation:
+                # Plugin rows are reconstructed from host-owned semantic data,
+                # never from their text.  This rechecks current grants and
+                # mints new opaque callback tokens for the new message.
+                try:
+                    if row.get("plugin_intent") is None:
+                        raise ValueError("legacy plugin obligation lacks semantic intent")
+                    from gateway.plugin_messaging import HostMessagingPermissions
+                    from gateway.plugin_outbox import PluginOutboxService
+                    from hermes_cli.config import load_config_readonly
+
+                    plugin_id, intent = PluginOutboxService.reconstruct_persisted(
+                        row,
+                        permissions=HostMessagingPermissions.from_raw(
+                            load_config_readonly()
+                        ),
+                        callback_registry=getattr(self, "_plugin_callback_registry", None),
+                    )
+                    delivered = await PluginOutboxService.deliver_persisted(
+                        adapter=adapter,
+                        obligation_id=row["obligation_id"],
+                        intent=intent,
+                        plugin_id=plugin_id,
+                        callback_registry=getattr(self, "_plugin_callback_registry", None),
+                        content_prefix=RECOVERED_MARKER if row.get("needs_marker") else "",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "obligation %s: plugin recovery rejected: %s",
+                        row["obligation_id"], exc,
+                    )
+                    mark_failed(row["obligation_id"], "plugin-intent-invalid")
+                    delivered = False
+                if delivered:
+                    redelivered += 1
+                # A malformed or revoked keyboard row intentionally has no
+                # text-only fallback; the durable state records the failure.
+                continue
+
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
@@ -7823,10 +7863,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             database_path=callback_database_path,
         )
         manager.set_plugin_callback_registry(callback_registry)
+        # Recovery runs after this startup binding, so retain only the
+        # host-owned registry—not an adapter, token, or plugin capability.
+        self._plugin_callback_registry = callback_registry
+        plugin_callback_router = manager.route_plugin_callback
+        self._plugin_callback_router = plugin_callback_router
         for adapter in self.adapters.values():
             bind_callback_router = getattr(adapter, "set_plugin_callback_router", None)
             if callable(bind_callback_router):
-                bind_callback_router(manager.route_plugin_callback)
+                bind_callback_router(plugin_callback_router)
 
         def _dispatch(*, obligation_id, intent, plugin_id) -> None:
             try:
@@ -9601,6 +9646,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter, platform, is_reconnect=True
                     )
                     if success:
+                        bind_callback_router = getattr(
+                            adapter, "set_plugin_callback_router", None
+                        )
+                        plugin_callback_router = getattr(
+                            self, "_plugin_callback_router", None
+                        )
+                        if callable(bind_callback_router) and callable(
+                            plugin_callback_router
+                        ):
+                            bind_callback_router(plugin_callback_router)
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).

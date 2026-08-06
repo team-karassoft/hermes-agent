@@ -107,9 +107,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            plugin_intent TEXT
         )"""
     )
+    # Additive migration: existing final-response rows intentionally remain
+    # readable as plain text obligations.  A non-NULL value is reserved for a
+    # host-validated semantic plugin intent and is never inferred from content.
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    if "plugin_intent" not in columns:
+        conn.execute("ALTER TABLE delivery_obligations ADD COLUMN plugin_intent TEXT")
 
 
 @contextmanager
@@ -194,6 +203,7 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
     replace_existing: bool = True,
+    plugin_intent: Optional[str] = None,
 ) -> bool:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -204,11 +214,11 @@ def record_obligation(
             f"""{insert} INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, plugin_intent)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
-             str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             str(thread_id) if thread_id else None, content, now, now, pid,
+             started, plugin_intent),
         )
     _prune()
     return cursor.rowcount > 0
@@ -263,13 +273,13 @@ def sweep_recoverable(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
+                      content, state, attempts, created_at, plugin_intent,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, plugin_intent, owner_pid, owner_started_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -301,6 +311,7 @@ def sweep_recoverable(
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "content": content,
+                    "plugin_intent": plugin_intent,
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
