@@ -82,6 +82,60 @@ class TestTelegramExecApproval:
     """Test the send_exec_approval method sends InlineKeyboard buttons."""
 
     @pytest.mark.asyncio
+    async def test_plugin_keyboard_bypasses_rich_send(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        adapter._should_attempt_rich = lambda *args, **kwargs: True
+        adapter._try_send_rich = AsyncMock()
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardButton", lambda text, callback_data: (text, callback_data))
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows)
+
+        await adapter.send("12345", "Review", metadata={"inline_keyboard": [[{"text": "Approve", "callback_token": "pc1.opaque.signature"}]]})
+
+        adapter._try_send_rich.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plugin_keyboard_is_bound_to_first_message_of_split_delivery(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 80
+        sent = []
+
+        async def send_message(**kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(message_id=40 + len(sent))
+
+        adapter._bot.send_message = AsyncMock(side_effect=send_message)
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardButton", lambda text, callback_data: (text, callback_data))
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows)
+
+        result = await adapter.send("12345", "word " * 100, metadata={"inline_keyboard": [[{"text": "Approve", "callback_token": "pc1.opaque.signature"}]]})
+
+        assert len(sent) > 1
+        assert result.message_id == "41"
+        assert sent[0]["reply_markup"] == [[("Approve", "pc1.opaque.signature")]]
+        assert all(call["reply_markup"] is None for call in sent[1:])
+
+    @pytest.mark.asyncio
+    async def test_host_rendered_plugin_keyboard_uses_only_opaque_callback_token(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: buttons.append((text, callback_data)) or (text, callback_data),
+        )
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows)
+
+        await adapter.send(
+            chat_id="12345", content="Review proposal", metadata={
+                "inline_keyboard": [[{"text": "Approve", "callback_token": "pc1.opaque.signature"}]]
+            },
+        )
+
+        assert buttons == [("Approve", "pc1.opaque.signature")]
+        assert adapter._bot.send_message.call_args.kwargs["reply_markup"] == [[("Approve", "pc1.opaque.signature")]]
+
+    @pytest.mark.asyncio
     async def test_sends_inline_keyboard(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()

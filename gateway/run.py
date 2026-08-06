@@ -7823,6 +7823,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             database_path=callback_database_path,
         )
         manager.set_plugin_callback_registry(callback_registry)
+        for adapter in self.adapters.values():
+            bind_callback_router = getattr(adapter, "set_plugin_callback_router", None)
+            if callable(bind_callback_router):
+                bind_callback_router(manager.route_plugin_callback)
 
         def _dispatch(*, obligation_id, intent, plugin_id) -> None:
             try:

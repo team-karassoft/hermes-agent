@@ -679,6 +679,8 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        # Host-owned router only; plugins never receive this adapter.
+        self._plugin_callback_router = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -3575,6 +3577,13 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._post_connect_task is asyncio.current_task():
                 self._post_connect_task = None
 
+    def set_plugin_callback_router(self, router) -> None:
+        """Attach the host callback callable; plugins cannot call this."""
+        callback_handler = router if callable(router) else getattr(router, "route_callback", None)
+        if not callable(callback_handler):
+            raise TypeError("plugin callback router must be callable")
+        self._plugin_callback_router = callback_handler
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -4323,6 +4332,28 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        plugin_keyboard = None
+        raw_keyboard = (metadata or {}).get("inline_keyboard")
+        if raw_keyboard is not None:
+            try:
+                if not isinstance(raw_keyboard, list) or not raw_keyboard:
+                    raise ValueError
+                rows = []
+                for raw_row in raw_keyboard:
+                    if not isinstance(raw_row, list) or not raw_row:
+                        raise ValueError
+                    row = []
+                    for item in raw_row:
+                        if not isinstance(item, dict) or set(item) != {"text", "callback_token"}:
+                            raise ValueError
+                        label, token = item["text"], item["callback_token"]
+                        if not isinstance(label, str) or not label.strip() or not isinstance(token, str) or not token.startswith("pc1.") or len(token) > 64:
+                            raise ValueError
+                        row.append(InlineKeyboardButton(label, callback_data=token))
+                    rows.append(row)
+                plugin_keyboard = InlineKeyboardMarkup(rows)
+            except (TypeError, ValueError):
+                return SendResult(success=False, error="invalid_plugin_inline_keyboard")
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -4330,7 +4361,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if raw_keyboard is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -4436,6 +4467,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=plugin_keyboard if i == 0 else None,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -4450,6 +4482,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=plugin_keyboard if i == 0 else None,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -6201,6 +6234,47 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Host-owned plugin callback tokens (pc1.<id>.<signature>) ---
+        # Never parse payload from Telegram callback_data. The router validates
+        # the opaque token, exact sent message, route, expiry, and replay state.
+        if data.startswith("pc1."):
+            router = self._plugin_callback_router
+            message_id = getattr(query_message, "message_id", None)
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if router is None or query_chat_id is None or message_id is None:
+                await query.answer(text="This approval is unavailable.")
+                return
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve this change.")
+                return
+            from gateway.plugin_callbacks import TrustedCallback
+            from gateway.plugin_messaging import TopicRoute
+
+            outcome = await router(
+                TrustedCallback(
+                    token=data,
+                    route=TopicRoute(
+                        "telegram", str(query_chat_id),
+                        str(query_thread_id) if query_thread_id is not None else None,
+                    ),
+                    message_id=str(message_id),
+                    sender_id=caller_id or None,
+                    event_id=f"telegram:callback:{getattr(query, 'id', message_id)}",
+                    received_at=datetime.now(timezone.utc),
+                )
+            )
+            if outcome.action == "claim":
+                await query.answer(text="Approval received.")
+            else:
+                await query.answer(text="This approval is invalid, expired, or already used.")
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
