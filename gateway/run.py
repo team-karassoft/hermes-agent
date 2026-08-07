@@ -8782,6 +8782,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
+        # Interval tasks refuse to start before the runner is live. Keep this
+        # invocation adjacent to the lifecycle transition so startup cannot
+        # consume its only scheduling opportunity while ``_running`` is false.
+        self._start_gateway_interval_tasks()
         self._update_runtime_status("running")
         self._bind_plugin_messaging_dispatcher()
 
@@ -8812,7 +8816,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
-        self._start_gateway_interval_tasks()
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
