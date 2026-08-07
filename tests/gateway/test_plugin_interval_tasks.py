@@ -91,6 +91,9 @@ async def test_gateway_interval_tasks_start_once_only_while_running(monkeypatch)
     )
 
     class _Manager:
+        def discover_and_load(self):
+            return None
+
         def get_gateway_interval_tasks(self):
             return (registration,)
 
@@ -115,6 +118,40 @@ async def test_gateway_interval_tasks_start_once_only_while_running(monkeypatch)
     assert first_task.get_name() == f"plugin-interval:{registration.name}"
 
     await runner._stop_gateway_interval_tasks()
+
+
+@pytest.mark.asyncio
+async def test_gateway_interval_tasks_discover_standalone_plugin_before_snapshot(
+    monkeypatch,
+) -> None:
+    """Gateway startup must load standalone registrations before taking its snapshot."""
+    context, manager = _context()
+    discovered = False
+
+    async def callback() -> None:
+        return None
+
+    def discover_and_load() -> None:
+        nonlocal discovered
+        discovered = True
+        context.register_gateway_interval_task("refresh", 30, callback)
+
+    monkeypatch.setattr(manager, "discover_and_load", discover_and_load)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: manager,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._gateway_interval_tasks_started = False
+    runner._gateway_interval_task_handles = {}
+
+    runner._start_gateway_interval_tasks()
+
+    assert discovered is True
+    task = runner._gateway_interval_task_handles["example-plugin:refresh"]
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

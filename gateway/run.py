@@ -9841,7 +9841,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_cli.plugins import get_plugin_manager
 
-            registrations = get_plugin_manager().get_gateway_interval_tasks()
+            manager = get_plugin_manager()
+            # Standalone plugins register interval tasks during discovery. The
+            # gateway has no other guaranteed plugin-discovery path before this
+            # startup snapshot, so load them here before scheduling callbacks.
+            manager.discover_and_load()
+            registrations = manager.get_gateway_interval_tasks()
         except Exception:
             logger.warning(
                 "Could not load plugin gateway interval task registrations",
