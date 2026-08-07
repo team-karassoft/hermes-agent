@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import (
     GatewayRunner,
     _PLUGIN_INTERVAL_BACKOFF_CAP_SECONDS,
@@ -32,6 +32,38 @@ def _context() -> tuple[PluginContext, PluginManager]:
 
 async def _callback_with_required_argument(_value) -> None:
     return None
+
+
+@pytest.mark.asyncio
+async def test_gateway_start_invokes_interval_start_after_running(monkeypatch, tmp_path) -> None:
+    """Startup must not spend its only interval-start call before becoming live."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    config = GatewayConfig(
+        platforms={
+            Platform.YUANBAO: PlatformConfig(
+                enabled=True,
+                extra={"dm_policy": "open"},
+            ),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda platform, config: None)
+    running_at_interval_start = []
+
+    def record_interval_start() -> None:
+        running_at_interval_start.append(runner._running)
+
+    monkeypatch.setattr(runner, "_start_gateway_interval_tasks", record_interval_start)
+
+    assert await runner.start() is True
+    assert running_at_interval_start == [True]
+
+    heartbeat = getattr(runner, "_loop_heartbeat_task", None)
+    if heartbeat is not None:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 @pytest.mark.parametrize(
