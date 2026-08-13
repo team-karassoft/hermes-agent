@@ -98,6 +98,48 @@ def test_keyboard_contract_is_typed_and_rejects_raw_callback_data() -> None:
         Button(label="Bad", action="bad_payload", payload={"value": object()})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_ttl", "expected_ttl"),
+    [(None, 900), (28_800, 28_800)],
+)
+async def test_host_uses_button_callback_ttl_or_compatible_default(
+    monkeypatch, tmp_path, registry, requested_ttl, expected_ttl
+) -> None:
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    requested_ttls = []
+    issue_for = registry.issue_for
+
+    def record_issue_for(**kwargs):
+        requested_ttls.append(kwargs["ttl_seconds"])
+        return issue_for(**kwargs)
+
+    monkeypatch.setattr(registry, "issue_for", record_issue_for)
+    button_kwargs = (
+        {"callback_ttl_seconds": requested_ttl} if requested_ttl is not None else {}
+    )
+    intent = PluginOutboundIntent(
+        idempotency_key="proposal:long-approval",
+        route=ROUTE,
+        text="Review proposal",
+        keyboard=InlineKeyboard(rows=((Button(
+            label="Approve", action="approve_proposal", payload={"proposal_id": "7"},
+            **button_kwargs,
+        ),),)),
+    )
+    service = PluginOutboxService(_permissions("owner"), callback_registry=registry)
+    obligation_id, accepted = service.accept(plugin_id="owner", intent=intent)
+
+    assert accepted is True
+    assert await service.deliver_persisted(
+        adapter=_Adapter(), obligation_id=obligation_id, intent=intent,
+        plugin_id="owner", callback_registry=registry,
+    )
+    assert requested_ttls == [expected_ttl]
+
+
 def test_inline_keyboard_requires_its_own_host_grant(registry) -> None:
     text_only = HostMessagingPermissions.from_raw(
         {
