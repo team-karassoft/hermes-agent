@@ -151,7 +151,7 @@ class PluginOutboxService:
                 for button in row:
                     token = callback_registry.issue_for(
                         plugin_id=plugin_id, route=intent.route, action=button.action,
-                        payload=button.payload, ttl_seconds=900,
+                        payload=button.payload, ttl_seconds=button.callback_ttl_seconds,
                     )
                     tokens.append(token)
                     rendered_row.append({"text": button.label, "callback_token": token})
@@ -230,7 +230,12 @@ def _semantic_keyboard(keyboard: InlineKeyboard | None) -> list[list[dict[str, A
             payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
             if len(payload_json.encode()) > _MAX_PAYLOAD_BYTES:
                 raise ValueError("keyboard payload exceeds durable bound")
-            rendered.append({"label": button.label, "action": button.action, "payload": payload})
+            rendered.append({
+                "label": button.label,
+                "action": button.action,
+                "payload": payload,
+                "callback_ttl_seconds": button.callback_ttl_seconds,
+            })
         rows.append(rendered)
     return rows
 
@@ -267,10 +272,16 @@ def _keyboard_from_semantic(value: Any) -> InlineKeyboard | None:
             raise ValueError("keyboard semantics are invalid")
         buttons = []
         for item in row:
-            if not isinstance(item, dict) or set(item) != {"label", "action", "payload"}:
+            if not isinstance(item, dict) or set(item) not in (
+                {"label", "action", "payload"},
+                {"label", "action", "payload", "callback_ttl_seconds"},
+            ):
                 raise ValueError("keyboard button semantics are invalid")
             _reject_transport_secrets(item["payload"])
-            button = Button(item["label"], item["action"], item["payload"])
+            button = Button(
+                item["label"], item["action"], item["payload"],
+                callback_ttl_seconds=item.get("callback_ttl_seconds", 900),
+            )
             _semantic_keyboard(InlineKeyboard(rows=((button,),)))
             buttons.append(button)
         rows.append(tuple(buttons))

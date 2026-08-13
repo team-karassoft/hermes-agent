@@ -160,6 +160,49 @@ def test_accepts_normal_semantic_keyboard_payload(hermes_home):
     assert _state(obligation_id) == "pending"
 
 
+@pytest.mark.parametrize("invalid_ttl", [True, 59, 28_801, 900.0, "900"])
+def test_invalid_button_callback_ttl_is_rejected_before_ledger_persistence(
+    hermes_home, invalid_ttl
+):
+    with pytest.raises(ValueError, match="callback_ttl_seconds"):
+        Button(
+            "Approve", "approve_proposal", {"proposal_id": "7"},
+            callback_ttl_seconds=invalid_ttl,
+        )
+
+    assert _obligation_count() == 0
+
+
+def test_reconstructed_keyboard_preserves_requested_callback_ttl(hermes_home):
+    registry = HostCallbackRegistry(signing_key=b"test-signing-key", database_path=hermes_home / "callbacks.db")
+    permissions = HostMessagingPermissions.from_raw(_config())
+    service = PluginOutboxService(permissions, callback_registry=registry)
+    intent = PluginOutboundIntent(
+        idempotency_key="proposal:long-approval",
+        route=ROUTE,
+        text="Review the durable proposal",
+        keyboard=InlineKeyboard(rows=((Button(
+            "Approve", "approve_proposal", {"proposal_id": "7"},
+            callback_ttl_seconds=28_800,
+        ),),)),
+    )
+    obligation_id, accepted = service.accept(plugin_id="owner", intent=intent)
+    assert accepted
+
+    with sqlite3.connect(dl._db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)
+        ).fetchone()
+    plugin_id, reconstructed = service.reconstruct_persisted(
+        dict(row), permissions=permissions, callback_registry=registry,
+    )
+
+    assert plugin_id == "owner"
+    assert reconstructed.keyboard is not None
+    assert reconstructed.keyboard.rows[0][0].callback_ttl_seconds == 28_800
+
+
 @pytest.mark.asyncio
 async def test_crash_before_keyboard_delivery_recovers_semantics_with_fresh_bound_token(
     hermes_home, monkeypatch

@@ -24,6 +24,10 @@ EventKind = Literal["message", "callback"]
 SubscriptionMode = Literal["observer", "consumer"]
 EventHandler = Callable[["PluginMessageEvent"], Any | Awaitable[Any]]
 
+_DEFAULT_CALLBACK_TTL_SECONDS = 900
+_MIN_CALLBACK_TTL_SECONDS = 60
+_MAX_CALLBACK_TTL_SECONDS = 28_800
+
 
 class SubscriptionError(ValueError):
     """A plugin subscription request does not meet the Phase 1 contract."""
@@ -61,6 +65,7 @@ class Button:
     label: str
     action: str
     payload: Mapping[str, Any]
+    callback_ttl_seconds: int = _DEFAULT_CALLBACK_TTL_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label.strip():
@@ -71,6 +76,14 @@ class Button:
             raise ValueError("button action must be a stable semantic name")
         if not isinstance(self.payload, Mapping):
             raise ValueError("button payload must be a mapping")
+        if (
+            isinstance(self.callback_ttl_seconds, bool)
+            or not isinstance(self.callback_ttl_seconds, int)
+            or not _MIN_CALLBACK_TTL_SECONDS <= self.callback_ttl_seconds <= _MAX_CALLBACK_TTL_SECONDS
+        ):
+            raise ValueError(
+                "button callback_ttl_seconds must be an integer between 60 and 28800"
+            )
         try:
             normalized = json.loads(
                 json.dumps(
