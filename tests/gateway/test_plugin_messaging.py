@@ -279,6 +279,149 @@ async def test_gateway_observes_after_legacy_hook_without_changing_agent_dispatc
     assert agent_calls == ["evidence"]
 
 
+def _gateway_runner_for_messaging():
+    """Build the smallest real GatewayRunner path up to slash fallback."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = type("Config", (), {"platforms": {Platform.TELEGRAM: object()}})()
+    runner.adapters = {Platform.TELEGRAM: object()}
+    runner._running_agents = {}
+    runner._update_prompt_pending = {}
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    return runner
+
+
+def _install_messaging_manager(monkeypatch, manager) -> None:
+    from hermes_cli import plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "plugin_messaging": {
+                plugin_id: {
+                    "inbound": [{
+                        "platform": "telegram", "chat_id": APPROVED_TOPIC.chat_id,
+                        "thread_id": APPROVED_TOPIC.thread_id, "events": ["message"],
+                    }]
+                }
+                for plugin_id in ("consumer", "other")
+            }
+        },
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *args, **kwargs: [])
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "*")
+
+
+def _subscribe_gateway_consumer(
+    manager, handler, *, route=APPROVED_TOPIC, plugin_id="consumer", subscription_id="gateway-restart"
+) -> None:
+    from hermes_cli.plugins import PluginContext, PluginManifest
+
+    PluginContext(PluginManifest(name=plugin_id, key=plugin_id), manager).messaging.subscribe(
+        subscription_id=subscription_id, routes=[route], event_types={"message"},
+        mode="consumer", handler=handler,
+        consumer=ConsumerDeclaration(command_namespace="gateway-restart"),
+    )
+
+
+def _gateway_restart_event() -> MessageEvent:
+    event = _trusted_event()
+    event.text = "/gateway-restart"
+    return event
+
+
+@pytest.mark.asyncio
+async def test_gateway_exact_consumer_claims_before_unknown_slash_fallback(monkeypatch) -> None:
+    """An authorized exact /gateway-restart consumer owns its command."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    claimed: list[str] = []
+    _subscribe_gateway_consumer(manager, lambda event: (claimed.append(event.text or "") or {"action": "claim"}))
+    _install_messaging_manager(monkeypatch, manager)
+
+    assert await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event()) is None
+    assert claimed == ["/gateway-restart"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_consumer_reject_suppresses_unknown_slash_fallback(monkeypatch) -> None:
+    """A consumer rejection is terminal and must not become an LLM/unknown command."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_consumer(manager, lambda event: {"action": "reject"})
+    _install_messaging_manager(monkeypatch, manager)
+
+    assert await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event()) is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_consumer_allow_preserves_unknown_slash_fallback(monkeypatch) -> None:
+    """Consumer allow means normal slash handling remains unchanged."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_consumer(manager, lambda event: {"action": "allow"})
+    _install_messaging_manager(monkeypatch, manager)
+
+    result = await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event())
+    assert result is not None
+    assert "Unknown command `/gateway-restart`" in result
+
+
+@pytest.mark.asyncio
+async def test_gateway_no_matching_consumer_preserves_unknown_slash_fallback(monkeypatch) -> None:
+    """A consumer registered for a different exact topic cannot bypass fallback."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_consumer(manager, lambda event: {"action": "claim"}, route=OTHER_TOPIC)
+    _install_messaging_manager(monkeypatch, manager)
+
+    result = await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event())
+    assert result is not None
+    assert "Unknown command `/gateway-restart`" in result
+
+
+@pytest.mark.asyncio
+async def test_gateway_consumer_error_rejects_safely_before_agent_or_fallback(monkeypatch) -> None:
+    """A broken consumer must fail closed without exposing implementation details."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+
+    def _broken_consumer(event):
+        raise RuntimeError("private consumer failure")
+
+    _subscribe_gateway_consumer(manager, _broken_consumer)
+    _install_messaging_manager(monkeypatch, manager)
+
+    result = await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event())
+    assert result is not None
+    assert "could not be processed" in result.lower()
+    assert "Unknown command" not in result
+    assert "private consumer failure" not in result
+
+
+@pytest.mark.asyncio
+async def test_gateway_consumer_conflict_rejects_safely_before_unknown_fallback(monkeypatch) -> None:
+    """Equal-priority eligible consumers fail closed rather than choosing one."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_consumer(manager, lambda event: {"action": "claim"})
+    _subscribe_gateway_consumer(
+        manager, lambda event: {"action": "claim"}, plugin_id="other", subscription_id="other-restart"
+    )
+    _install_messaging_manager(monkeypatch, manager)
+
+    result = await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event())
+    assert result == "This message could not be processed safely."
+
+
 def test_duplicate_subscription_id_fails() -> None:
     router = PluginMessageRouter(_permissions("observer"))
     handler = lambda event: None

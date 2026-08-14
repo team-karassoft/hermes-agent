@@ -11421,17 +11421,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        # Phase 2 observers fan out after authorization. Only a valid host-routed
-        # consumer claim suppresses normal agent dispatch; conflicts/errors fail open.
+        # Route authorized normal inbound messages through the host-owned plugin
+        # bus before command fallback.  Callback adapters use their separate,
+        # validated callback entry point and never enter this MessageEvent path.
+        # Only an explicit ``allow`` continues.  Consumer rejections are
+        # terminal; router faults/conflicts must fail closed without exposing
+        # plugin internals or reaching the agent.
         if not is_internal:
+            _plugin_messaging_rejection = "This message could not be processed safely."
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
                 _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
-                if _messaging_outcome is not None and _messaging_outcome.action == "claim":
-                    logger.info("plugin messaging consumer claimed event: plugin=%s", _messaging_outcome.consumer_plugin_id)
+            except Exception:
+                logger.warning("plugin messaging dispatch failed", exc_info=True)
+                return _plugin_messaging_rejection
+            if _messaging_outcome is not None:
+                if _messaging_outcome.action == "claim":
+                    logger.info(
+                        "plugin messaging consumer claimed event: plugin=%s",
+                        _messaging_outcome.consumer_plugin_id,
+                    )
                     return None
-            except Exception as _messaging_exc:
-                logger.warning("plugin messaging dispatch failed: %s", _messaging_exc)
+                if _messaging_outcome.action == "reject":
+                    logger.info(
+                        "plugin messaging consumer rejected event: plugin=%s",
+                        _messaging_outcome.consumer_plugin_id,
+                    )
+                    return None
+                if _messaging_outcome.action in {"conflict", "error"}:
+                    logger.warning(
+                        "plugin messaging routing rejected event: action=%s",
+                        _messaging_outcome.action,
+                    )
+                    return _plugin_messaging_rejection
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
