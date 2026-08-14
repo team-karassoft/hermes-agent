@@ -438,6 +438,71 @@ async def test_gateway_undeclared_or_invalid_hash_text_reaches_agent_unchanged(m
 
 
 @pytest.mark.asyncio
+async def test_gateway_ordinary_hash_text_reaches_agent_when_hash_routing_would_raise(monkeypatch) -> None:
+    """No exact candidate means the fallible hash dispatch is never invoked."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")))
+    monkeypatch.setattr(manager, "route_prepared_hash_messaging_event", lambda event: (_ for _ in ()).throw(RuntimeError("router unavailable")))
+    runner = _gateway_runner_for_messaging()
+
+    async def _agent(event, source, quick_key, generation):
+        return event.text
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event("#ordinary note")) == "#ordinary note"
+
+
+@pytest.mark.asyncio
+async def test_gateway_exact_hash_candidate_router_exception_fails_closed(monkeypatch) -> None:
+    """Once preflight finds a candidate, dispatch failures are terminal."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+
+    async def _raise(event):
+        raise RuntimeError("router unavailable")
+
+    monkeypatch.setattr(manager, "route_prepared_hash_messaging_event", _raise)
+    assert await _gateway_runner_for_messaging()._handle_message(_gateway_hash_restart_event()) == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+async def test_gateway_exact_hash_candidate_config_exception_fails_closed(monkeypatch) -> None:
+    """A failed grant refresh cannot dispatch a candidate retained in router state."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+    event = _gateway_hash_restart_event()
+    assert manager.prepare_hash_messaging_route(event)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")))
+    assert await _gateway_runner_for_messaging()._handle_message(event) == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+async def test_gateway_hash_no_candidate_normal_flow_reaches_agent(monkeypatch) -> None:
+    """A valid hash token without an authorized matching consumer remains agent text."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+
+    async def _agent(event, source, quick_key, generation):
+        return event.text
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event()) == "#gateway-restart default"
+
+
+@pytest.mark.asyncio
 async def test_gateway_exact_consumer_claims_before_unknown_slash_fallback(monkeypatch) -> None:
     """An authorized exact /gateway-restart consumer owns its command."""
     from hermes_cli.plugins import PluginManager
@@ -674,8 +739,13 @@ def test_consumer_requires_a_valid_namespace_declaration() -> None:
     for invalid in ("Gateway", "gateway.restart", "gateway@bot", "gateway restart"):
         with pytest.raises(SubscriptionError, match="hash command namespace"):
             ConsumerDeclaration(hash_command_namespace=invalid)
+    for invalid in (1, True, []):
+        with pytest.raises(SubscriptionError, match="hash command namespace must be a string"):
+            ConsumerDeclaration(hash_command_namespace=invalid)
     with pytest.raises(SubscriptionError, match="exactly one namespace"):
         ConsumerDeclaration(command_namespace="slash", hash_command_namespace="hash")
+    with pytest.raises(SubscriptionError, match="exactly one namespace"):
+        ConsumerDeclaration(hash_command_namespace="hash", callback_ownership="owner")
 
 
 

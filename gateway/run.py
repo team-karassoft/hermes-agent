@@ -11447,7 +11447,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _plugin_messaging_rejection = "This message could not be processed safely."
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
-                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+                _plugin_manager = _get_plugin_manager()
+                if not _plugin_manager.prepare_hash_messaging_route(event):
+                    _messaging_outcome = None
+                else:
+                    _messaging_outcome = await _plugin_manager.route_prepared_hash_messaging_event(event)
             except Exception:
                 logger.warning("plugin messaging hash-command dispatch failed", exc_info=True)
                 return _plugin_messaging_rejection

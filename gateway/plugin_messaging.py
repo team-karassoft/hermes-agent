@@ -207,6 +207,8 @@ class ConsumerDeclaration:
             raise SubscriptionError("consumer declaration must declare exactly one namespace")
         if self.command_namespace is not None and not re.fullmatch(r"[a-z][a-z0-9_-]*", self.command_namespace):
             raise SubscriptionError("consumer command namespace must be lowercase letters, digits, '_' or '-'")
+        if self.hash_command_namespace is not None and not isinstance(self.hash_command_namespace, str):
+            raise SubscriptionError("consumer hash command namespace must be a string")
         if self.hash_command_namespace is not None and not re.fullmatch(r"[a-z][a-z0-9_-]*", self.hash_command_namespace):
             raise SubscriptionError("consumer hash command namespace must be lowercase letters, digits, '_' or '-'")
         if self.callback_ownership is not None and not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.callback_ownership):
@@ -436,6 +438,22 @@ class PluginMessageRouter:
             and envelope.kind in subscription.event_types
             and self._permissions.allows(subscription.plugin_id, envelope.route, envelope.kind)
         ]
+
+    def has_eligible_hash_command_candidate(self, event: Any) -> bool:
+        """Check the current authorized router snapshot without invoking plugins.
+
+        This is deliberately a preflight, not routing: the gateway uses it to
+        decide whether a leading ``#`` is ordinary agent text before it enters
+        the potentially fallible consumer dispatch path. It consults only the
+        already-installed declarations and permissions and has no side effects.
+        """
+        envelope = event if isinstance(event, PluginMessageEvent) else PluginMessageEvent.from_message_event(event)
+        return any(
+            subscription.consumer is not None
+            and subscription.consumer.hash_command_namespace is not None
+            and self._command_matches(envelope, subscription.consumer)
+            for subscription in self._eligible(envelope, "consumer")
+        )
 
     @staticmethod
     def _command_matches(envelope: PluginMessageEvent, declaration: ConsumerDeclaration) -> bool:

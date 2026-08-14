@@ -1469,6 +1469,36 @@ class PluginManager:
         self._messaging_router.set_permissions(HostMessagingPermissions.from_raw(load_config_readonly()))
         return await self._messaging_router.route(event)
 
+    def prepare_hash_messaging_route(self, event: Any) -> bool:
+        """Refresh grants and side-effect-free preflight an exact hash consumer.
+
+        When current config cannot be read, only already-installed router
+        permissions are used. Ordinary hash text then keeps agent dispatch;
+        a previously eligible exact candidate still fails closed if dispatch
+        itself cannot complete.
+        """
+        if not self._messaging_router.has_subscriptions:
+            return False
+        from gateway.plugin_messaging import HostMessagingPermissions
+        from hermes_cli.config import load_config_readonly
+        try:
+            self._messaging_router.set_permissions(
+                HostMessagingPermissions.from_raw(load_config_readonly())
+            )
+        except Exception:
+            logger.warning("plugin messaging hash-command preflight config failed", exc_info=True)
+            # A cached exact authorized candidate is security-relevant. Do not
+            # invoke it after a failed refresh: surface the error to the
+            # gateway's fail-closed boundary. No candidate remains normal text.
+            if self._messaging_router.has_eligible_hash_command_candidate(event):
+                raise
+            return False
+        return self._messaging_router.has_eligible_hash_command_candidate(event)
+
+    async def route_prepared_hash_messaging_event(self, event: Any) -> Any:
+        """Route an exact hash command already accepted by preflight."""
+        return await self._messaging_router.route(event)
+
     async def dispatch_messaging_event(self, event: Any) -> int:
         """Fan out an inbound event using only active-profile host grants.
 
