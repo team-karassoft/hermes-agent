@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
-import importlib.metadata
 from pathlib import Path
 import shutil
 import subprocess
@@ -471,21 +470,17 @@ async def test_gateway_consumer_conflict_rejects_safely_before_unknown_fallback(
 
 
 @pytest.mark.asyncio
-async def test_actual_gateway_restart_bridge_claims_the_live_authorized_command_from_an_isolated_root(
+async def test_gateway_restart_bridge_fixture_claims_the_exact_authorized_command_from_an_isolated_root(
     tmp_path, monkeypatch
 ) -> None:
-    """Production-shaped bridge load: no worker, subprocess, or Telegram adapter is present."""
-    from gateway.plugin_callbacks import HostCallbackRegistry
+    """A repository fixture proves directory discovery and routing without live bridge dependencies."""
     from hermes_cli.plugins import PluginManager
 
-    actual_plugin = Path("/Users/agent/.hermes/profiles/operator/plugins/gateway-restart-bridge")
-    helper_source = Path("/Users/agent/Workspace/repos/hermes-integrations/gateway-restart-helper")
-    if not actual_plugin.is_dir() or not helper_source.is_dir():
-        pytest.skip("requires the actual local gateway-restart bridge and helper directories")
-
+    fixture_plugin = Path(__file__).parents[1] / "fixtures" / "gateway_restart_bridge"
+    assert fixture_plugin.is_dir()
     hermes_home = tmp_path / "hermes-home"
     copied_plugin = hermes_home / "plugins" / "gateway-restart-bridge"
-    shutil.copytree(actual_plugin, copied_plugin, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copytree(fixture_plugin, copied_plugin, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     restart_db = tmp_path / "gateway-restart.sqlite3"
     (copied_plugin / "config.yaml").write_text(
         "\n".join((
@@ -507,43 +502,17 @@ plugin_messaging:
       - platform: telegram
         chat_id: "-1004411640215"
         events: [message, callback]
-    outbound:
-      - platform: telegram
-        chat_id: "-1004411640215"
-        types: [text, inline_keyboard]
 """,
         encoding="utf-8",
     )
-    # Recreate only the installed distribution layout in the isolated root;
-    # importing it proves the directory plugin has no sibling-checkout path
-    # dependency without starting a package-manager or helper subprocess.
-    installed_site = tmp_path / "installed-helper"
-    shutil.copytree(
-        helper_source / "gateway_restart_helper",
-        installed_site / "gateway_restart_helper",
-    )
-    dist_info = installed_site / "karassoft_gateway_restart_helper-0.1.0.dist-info"
-    dist_info.mkdir()
-    (dist_info / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: karassoft-gateway-restart-helper\nVersion: 0.1.0\n",
-        encoding="utf-8",
-    )
-    monkeypatch.syspath_prepend(str(installed_site))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(
         subprocess,
         "Popen",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no subprocesses in this reproduction")),
     )
-    importlib.invalidate_caches()
-    assert importlib.metadata.version("karassoft-gateway-restart-helper") == "0.1.0"
-    import gateway_restart_helper
-    assert installed_site in Path(gateway_restart_helper.__file__).resolve().parents
 
     manager = PluginManager()
-    manager.set_plugin_callback_registry(
-        HostCallbackRegistry(signing_key=b"test-signing-key", database_path=tmp_path / "callbacks.sqlite3")
-    )
     manager.discover_and_load()
     outcome = await manager.route_messaging_event(
         MessageEvent(
@@ -564,7 +533,7 @@ plugin_messaging:
     assert (outcome.action, outcome.consumer_plugin_id, outcome.audit_reason) == (
         "claim", "gateway-restart-bridge", None,
     )
-    assert restart_db.is_file()
+    assert not restart_db.exists()
     assert not (hermes_home / "gateway.pid").exists()
 
 

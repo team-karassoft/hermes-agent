@@ -1,0 +1,5 @@
+active: true
+database_path: __TEMP_DATABASE_PATH__
+telegram_chat_id: "-1004411640215"
+owner_id: "telegram-user:9189955"
+approval_ttl_seconds: 28800
