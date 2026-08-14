@@ -325,13 +325,17 @@ def _subscribe_gateway_consumer(
     plugin_id="consumer",
     subscription_id="gateway-restart",
     command_namespace="gateway-restart",
+    hash_command_namespace=None,
 ) -> None:
     from hermes_cli.plugins import PluginContext, PluginManifest
 
     PluginContext(PluginManifest(name=plugin_id, key=plugin_id), manager).messaging.subscribe(
         subscription_id=subscription_id, routes=[route], event_types={"message"},
         mode="consumer", handler=handler,
-        consumer=ConsumerDeclaration(command_namespace=command_namespace),
+        consumer=ConsumerDeclaration(
+            command_namespace=command_namespace,
+            hash_command_namespace=hash_command_namespace,
+        ),
     )
 
 
@@ -339,6 +343,163 @@ def _gateway_restart_event() -> MessageEvent:
     event = _trusted_event()
     event.text = "/gateway-restart"
     return event
+
+
+def _gateway_hash_restart_event(text="#gateway-restart default") -> MessageEvent:
+    event = _trusted_event()
+    event.text = text
+    return event
+
+
+def _subscribe_gateway_hash_consumer(manager, handler, **kwargs) -> None:
+    kwargs.setdefault("command_namespace", None)
+    kwargs.setdefault("hash_command_namespace", "gateway-restart")
+    _subscribe_gateway_consumer(manager, handler, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ("claim", "reject"))
+async def test_gateway_exact_hash_consumer_terminal_actions_precede_agent(monkeypatch, action) -> None:
+    """An authorized exact hash namespace can terminally own only its declared command."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": action})
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+    agent_calls: list[str] = []
+
+    async def _agent(event, source, quick_key, generation):
+        agent_calls.append(event.text)
+        return "normal-dispatch"
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event()) is None
+    assert agent_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ("allow",))
+async def test_gateway_hash_consumer_allow_falls_through_to_agent(monkeypatch, action) -> None:
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": action})
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+
+    async def _agent(event, source, quick_key, generation):
+        return event.text
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event()) == "#gateway-restart default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", (lambda event: (_ for _ in ()).throw(RuntimeError("private consumer failure")),))
+async def test_gateway_hash_consumer_error_fails_closed(monkeypatch, handler) -> None:
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, handler)
+    _install_messaging_manager(monkeypatch, manager)
+    result = await _gateway_runner_for_messaging()._handle_message(_gateway_hash_restart_event())
+    assert result == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+async def test_gateway_hash_consumer_conflict_fails_closed(monkeypatch) -> None:
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _subscribe_gateway_hash_consumer(
+        manager, lambda event: {"action": "claim"}, plugin_id="other", subscription_id="other-restart"
+    )
+    _install_messaging_manager(monkeypatch, manager)
+    assert await _gateway_runner_for_messaging()._handle_message(_gateway_hash_restart_event()) == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ("#ordinary note", "#gateway-restart@bot default", "#Gateway-restart default"))
+async def test_gateway_undeclared_or_invalid_hash_text_reaches_agent_unchanged(monkeypatch, text) -> None:
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+
+    async def _agent(event, source, quick_key, generation):
+        return event.text
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event(text)) == text
+
+
+@pytest.mark.asyncio
+async def test_gateway_ordinary_hash_text_reaches_agent_when_hash_routing_would_raise(monkeypatch) -> None:
+    """No exact candidate means the fallible hash dispatch is never invoked."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")))
+    monkeypatch.setattr(manager, "route_prepared_hash_messaging_event", lambda event: (_ for _ in ()).throw(RuntimeError("router unavailable")))
+    runner = _gateway_runner_for_messaging()
+
+    async def _agent(event, source, quick_key, generation):
+        return event.text
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event("#ordinary note")) == "#ordinary note"
+
+
+@pytest.mark.asyncio
+async def test_gateway_exact_hash_candidate_router_exception_fails_closed(monkeypatch) -> None:
+    """Once preflight finds a candidate, dispatch failures are terminal."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+
+    async def _raise(event):
+        raise RuntimeError("router unavailable")
+
+    monkeypatch.setattr(manager, "route_prepared_hash_messaging_event", _raise)
+    assert await _gateway_runner_for_messaging()._handle_message(_gateway_hash_restart_event()) == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+async def test_gateway_exact_hash_candidate_config_exception_fails_closed(monkeypatch) -> None:
+    """A failed grant refresh cannot dispatch a candidate retained in router state."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _subscribe_gateway_hash_consumer(manager, lambda event: {"action": "claim"})
+    _install_messaging_manager(monkeypatch, manager)
+    event = _gateway_hash_restart_event()
+    assert manager.prepare_hash_messaging_route(event)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")))
+    assert await _gateway_runner_for_messaging()._handle_message(event) == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+async def test_gateway_hash_no_candidate_normal_flow_reaches_agent(monkeypatch) -> None:
+    """A valid hash token without an authorized matching consumer remains agent text."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+
+    async def _agent(event, source, quick_key, generation):
+        return event.text
+
+    runner._handle_message_with_agent = _agent
+    assert await runner._handle_message(_gateway_hash_restart_event()) == "#gateway-restart default"
 
 
 @pytest.mark.asyncio
@@ -470,7 +631,7 @@ async def test_gateway_consumer_conflict_rejects_safely_before_unknown_fallback(
 
 
 @pytest.mark.asyncio
-async def test_gateway_restart_bridge_fixture_claims_the_exact_authorized_command_from_an_isolated_root(
+async def test_gateway_restart_bridge_fixture_claims_the_exact_authorized_hash_command_from_an_isolated_root(
     tmp_path, monkeypatch
 ) -> None:
     """A repository fixture proves directory discovery and routing without live bridge dependencies."""
@@ -516,7 +677,7 @@ plugin_messaging:
     manager.discover_and_load()
     outcome = await manager.route_messaging_event(
         MessageEvent(
-            text="/gateway-restart default",
+            text="#gateway-restart default",
             message_id="production-shaped-command",
             platform_update_id=9189955,
             source=SessionSource(
@@ -573,6 +734,18 @@ def test_consumer_requires_a_valid_namespace_declaration() -> None:
             mode="consumer",
             handler=handler,
         )
+
+    assert ConsumerDeclaration(hash_command_namespace="gateway-restart").hash_command_namespace == "gateway-restart"
+    for invalid in ("Gateway", "gateway.restart", "gateway@bot", "gateway restart"):
+        with pytest.raises(SubscriptionError, match="hash command namespace"):
+            ConsumerDeclaration(hash_command_namespace=invalid)
+    for invalid in (1, True, []):
+        with pytest.raises(SubscriptionError, match="hash command namespace must be a string"):
+            ConsumerDeclaration(hash_command_namespace=invalid)
+    with pytest.raises(SubscriptionError, match="exactly one namespace"):
+        ConsumerDeclaration(command_namespace="slash", hash_command_namespace="hash")
+    with pytest.raises(SubscriptionError, match="exactly one namespace"):
+        ConsumerDeclaration(hash_command_namespace="hash", callback_ownership="owner")
 
 
 

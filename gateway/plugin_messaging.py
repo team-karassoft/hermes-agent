@@ -189,15 +189,28 @@ class ConsumerDeclaration:
     """A named Phase 2 consumer claim declaration."""
 
     command_namespace: str | None = None
+    hash_command_namespace: str | None = None
     callback_ownership: str | None = None
     priority: int = 0
 
     def __post_init__(self) -> None:
-        declared = [value for value in (self.command_namespace, self.callback_ownership) if value is not None]
+        declared = [
+            value
+            for value in (
+                self.command_namespace,
+                self.hash_command_namespace,
+                self.callback_ownership,
+            )
+            if value is not None
+        ]
         if len(declared) != 1:
             raise SubscriptionError("consumer declaration must declare exactly one namespace")
         if self.command_namespace is not None and not re.fullmatch(r"[a-z][a-z0-9_-]*", self.command_namespace):
             raise SubscriptionError("consumer command namespace must be lowercase letters, digits, '_' or '-'")
+        if self.hash_command_namespace is not None and not isinstance(self.hash_command_namespace, str):
+            raise SubscriptionError("consumer hash command namespace must be a string")
+        if self.hash_command_namespace is not None and not re.fullmatch(r"[a-z][a-z0-9_-]*", self.hash_command_namespace):
+            raise SubscriptionError("consumer hash command namespace must be lowercase letters, digits, '_' or '-'")
         if self.callback_ownership is not None and not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.callback_ownership):
             raise SubscriptionError("consumer callback ownership must be a stable namespace")
 
@@ -426,12 +439,34 @@ class PluginMessageRouter:
             and self._permissions.allows(subscription.plugin_id, envelope.route, envelope.kind)
         ]
 
+    def has_eligible_hash_command_candidate(self, event: Any) -> bool:
+        """Check the current authorized router snapshot without invoking plugins.
+
+        This is deliberately a preflight, not routing: the gateway uses it to
+        decide whether a leading ``#`` is ordinary agent text before it enters
+        the potentially fallible consumer dispatch path. It consults only the
+        already-installed declarations and permissions and has no side effects.
+        """
+        envelope = event if isinstance(event, PluginMessageEvent) else PluginMessageEvent.from_message_event(event)
+        return any(
+            subscription.consumer is not None
+            and subscription.consumer.hash_command_namespace is not None
+            and self._command_matches(envelope, subscription.consumer)
+            for subscription in self._eligible(envelope, "consumer")
+        )
+
     @staticmethod
     def _command_matches(envelope: PluginMessageEvent, declaration: ConsumerDeclaration) -> bool:
         if declaration.command_namespace is not None:
             text = (envelope.text or "").strip()
             command = text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
             return command == declaration.command_namespace
+        if declaration.hash_command_namespace is not None:
+            # Hash commands deliberately have no adapter mention form and retain
+            # their lowercase wire grammar.  Do not strip or normalize ordinary
+            # text: only an exact leading ``#namespace`` token is eligible.
+            match = re.fullmatch(r"#([a-z][a-z0-9_-]*)(?:[ \t]+[^\r\n]*)?", envelope.text or "")
+            return match is not None and match.group(1) == declaration.hash_command_namespace
         # Callback transport is deferred; a future adapter must create kind=callback.
         return envelope.kind == "callback" and declaration.callback_ownership is not None
 

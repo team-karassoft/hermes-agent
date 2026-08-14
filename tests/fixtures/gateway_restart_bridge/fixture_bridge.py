@@ -59,5 +59,5 @@ def register(ctx: Any) -> None:
         event_types={"message"},
         mode="consumer",
         handler=_claim_exact_owner,
-        consumer=ConsumerDeclaration(command_namespace="gateway-restart"),
+        consumer=ConsumerDeclaration(hash_command_namespace="gateway-restart"),
     )
