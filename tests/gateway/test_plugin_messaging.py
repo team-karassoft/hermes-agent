@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
+import importlib.metadata
+from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -315,14 +319,20 @@ def _install_messaging_manager(monkeypatch, manager) -> None:
 
 
 def _subscribe_gateway_consumer(
-    manager, handler, *, route=APPROVED_TOPIC, plugin_id="consumer", subscription_id="gateway-restart"
+    manager,
+    handler,
+    *,
+    route=APPROVED_TOPIC,
+    plugin_id="consumer",
+    subscription_id="gateway-restart",
+    command_namespace="gateway-restart",
 ) -> None:
     from hermes_cli.plugins import PluginContext, PluginManifest
 
     PluginContext(PluginManifest(name=plugin_id, key=plugin_id), manager).messaging.subscribe(
         subscription_id=subscription_id, routes=[route], event_types={"message"},
         mode="consumer", handler=handler,
-        consumer=ConsumerDeclaration(command_namespace="gateway-restart"),
+        consumer=ConsumerDeclaration(command_namespace=command_namespace),
     )
 
 
@@ -344,6 +354,44 @@ async def test_gateway_exact_consumer_claims_before_unknown_slash_fallback(monke
 
     assert await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event()) is None
     assert claimed == ["/gateway-restart"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "handler_name", "expected"),
+    [
+        ("approve", "_handle_approve_command", "host-approve"),
+        ("deny", "_handle_deny_command", "host-deny"),
+    ],
+)
+async def test_gateway_control_commands_are_host_precedent_over_exact_plugin_consumers(
+    monkeypatch, command, handler_name, expected
+) -> None:
+    """An authorized exact consumer cannot observe or take over host approval flow."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    received: list[str] = []
+    _subscribe_gateway_consumer(
+        manager,
+        lambda event: (received.append(event.text or "") or {"action": "claim"}),
+        command_namespace=command,
+    )
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+    host_calls: list[str] = []
+
+    async def _host_handler(event):
+        host_calls.append(event.text)
+        return expected
+
+    setattr(runner, handler_name, _host_handler)
+    event = _trusted_event()
+    event.text = f"/{command}"
+
+    assert await runner._handle_message(event) == expected
+    assert received == []
+    assert host_calls == [f"/{command}"]
 
 
 @pytest.mark.asyncio
@@ -420,6 +468,104 @@ async def test_gateway_consumer_conflict_rejects_safely_before_unknown_fallback(
 
     result = await _gateway_runner_for_messaging()._handle_message(_gateway_restart_event())
     assert result == "This message could not be processed safely."
+
+
+@pytest.mark.asyncio
+async def test_actual_gateway_restart_bridge_claims_the_live_authorized_command_from_an_isolated_root(
+    tmp_path, monkeypatch
+) -> None:
+    """Production-shaped bridge load: no worker, subprocess, or Telegram adapter is present."""
+    from gateway.plugin_callbacks import HostCallbackRegistry
+    from hermes_cli.plugins import PluginManager
+
+    actual_plugin = Path("/Users/agent/.hermes/profiles/operator/plugins/gateway-restart-bridge")
+    helper_source = Path("/Users/agent/Workspace/repos/hermes-integrations/gateway-restart-helper")
+    if not actual_plugin.is_dir() or not helper_source.is_dir():
+        pytest.skip("requires the actual local gateway-restart bridge and helper directories")
+
+    hermes_home = tmp_path / "hermes-home"
+    copied_plugin = hermes_home / "plugins" / "gateway-restart-bridge"
+    shutil.copytree(actual_plugin, copied_plugin, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    restart_db = tmp_path / "gateway-restart.sqlite3"
+    (copied_plugin / "config.yaml").write_text(
+        "\n".join((
+            "active: true",
+            f"database_path: {restart_db}",
+            'telegram_chat_id: "-1004411640215"',
+            'owner_id: "telegram-user:9189955"',
+            "approval_ttl_seconds: 28800",
+            "",
+        )),
+        encoding="utf-8",
+    )
+    (hermes_home / "config.yaml").write_text(
+        """plugins:
+  enabled: [gateway-restart-bridge]
+plugin_messaging:
+  gateway-restart-bridge:
+    inbound:
+      - platform: telegram
+        chat_id: "-1004411640215"
+        events: [message, callback]
+    outbound:
+      - platform: telegram
+        chat_id: "-1004411640215"
+        types: [text, inline_keyboard]
+""",
+        encoding="utf-8",
+    )
+    # Recreate only the installed distribution layout in the isolated root;
+    # importing it proves the directory plugin has no sibling-checkout path
+    # dependency without starting a package-manager or helper subprocess.
+    installed_site = tmp_path / "installed-helper"
+    shutil.copytree(
+        helper_source / "gateway_restart_helper",
+        installed_site / "gateway_restart_helper",
+    )
+    dist_info = installed_site / "karassoft_gateway_restart_helper-0.1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: karassoft-gateway-restart-helper\nVersion: 0.1.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(installed_site))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no subprocesses in this reproduction")),
+    )
+    importlib.invalidate_caches()
+    assert importlib.metadata.version("karassoft-gateway-restart-helper") == "0.1.0"
+    import gateway_restart_helper
+    assert installed_site in Path(gateway_restart_helper.__file__).resolve().parents
+
+    manager = PluginManager()
+    manager.set_plugin_callback_registry(
+        HostCallbackRegistry(signing_key=b"test-signing-key", database_path=tmp_path / "callbacks.sqlite3")
+    )
+    manager.discover_and_load()
+    outcome = await manager.route_messaging_event(
+        MessageEvent(
+            text="/gateway-restart default",
+            message_id="production-shaped-command",
+            platform_update_id=9189955,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1004411640215",
+                thread_id=None,
+                user_id="9189955",
+                chat_type="group",
+            ),
+        )
+    )
+
+    assert outcome is not None
+    assert (outcome.action, outcome.consumer_plugin_id, outcome.audit_reason) == (
+        "claim", "gateway-restart-bridge", None,
+    )
+    assert restart_db.is_file()
+    assert not (hermes_home / "gateway.pid").exists()
 
 
 def test_duplicate_subscription_id_fails() -> None:

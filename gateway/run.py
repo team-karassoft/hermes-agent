@@ -11421,39 +11421,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        # Route authorized normal inbound messages through the host-owned plugin
-        # bus before command fallback.  Callback adapters use their separate,
-        # validated callback entry point and never enter this MessageEvent path.
-        # Only an explicit ``allow`` continues.  Consumer rejections are
-        # terminal; router faults/conflicts must fail closed without exposing
-        # plugin internals or reaching the agent.
-        if not is_internal:
-            _plugin_messaging_rejection = "This message could not be processed safely."
+        # Plain inbound text keeps the observer-only routing contract: fan out
+        # authorized observers without changing ordinary agent dispatch. Slash
+        # commands are deliberately excluded here; all host command/control
+        # processing (including approvals) is host-precedent and an eligible
+        # plugin consumer is consulted only at the generic unknown-command
+        # fallback below. Callback adapters use their separate, validated
+        # callback entry point and never enter this MessageEvent path.
+        if not is_internal and not (event.text or "").lstrip().startswith("/"):
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
-                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+                await _get_plugin_manager().dispatch_messaging_event(event)
             except Exception:
-                logger.warning("plugin messaging dispatch failed", exc_info=True)
-                return _plugin_messaging_rejection
-            if _messaging_outcome is not None:
-                if _messaging_outcome.action == "claim":
-                    logger.info(
-                        "plugin messaging consumer claimed event: plugin=%s",
-                        _messaging_outcome.consumer_plugin_id,
-                    )
-                    return None
-                if _messaging_outcome.action == "reject":
-                    logger.info(
-                        "plugin messaging consumer rejected event: plugin=%s",
-                        _messaging_outcome.consumer_plugin_id,
-                    )
-                    return None
-                if _messaging_outcome.action in {"conflict", "error"}:
-                    logger.warning(
-                        "plugin messaging routing rejected event: action=%s",
-                        _messaging_outcome.action,
-                    )
-                    return _plugin_messaging_rejection
+                # Observer delivery is advisory. Preserve normal agent flow
+                # if its host router/config path is temporarily unavailable.
+                logger.warning("plugin messaging observer dispatch failed", exc_info=True)
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -12788,10 +12770,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
                         logger.warning(
                             "Unrecognized slash command /%s from %s — "
-                            "replying with unknown-command notice",
+                            "checking authorized plugin consumers before unknown-command notice",
                             command,
                             source.platform.value if source.platform else "?",
                         )
+                        # This is the sole inbound slash-consumer seam. Every
+                        # built-in/control command, quick command, plugin
+                        # command, skill command, and known-inactive skill has
+                        # already had its host-owned chance to handle the
+                        # message. Fail closed only here: a consumer error or
+                        # conflict must not fall through to the agent/unknown
+                        # command path, while allow/no-route preserves the
+                        # exact generic fallback below.
+                        _plugin_messaging_rejection = "This message could not be processed safely."
+                        try:
+                            from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                            _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+                        except Exception:
+                            logger.warning("plugin messaging unknown-command dispatch failed", exc_info=True)
+                            return _plugin_messaging_rejection
+                        if _messaging_outcome is not None:
+                            if _messaging_outcome.action in {"claim", "reject"}:
+                                logger.info(
+                                    "plugin messaging consumer %s unknown command: plugin=%s",
+                                    _messaging_outcome.action,
+                                    _messaging_outcome.consumer_plugin_id,
+                                )
+                                return None
+                            if _messaging_outcome.action in {"conflict", "error"}:
+                                logger.warning(
+                                    "plugin messaging routing rejected unknown command: action=%s",
+                                    _messaging_outcome.action,
+                                )
+                                return _plugin_messaging_rejection
                         return (
                             f"Unknown command `/{command}`. "
                             f"Type /commands to see what's available, "
