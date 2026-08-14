@@ -11426,9 +11426,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # commands are deliberately excluded here; all host command/control
         # processing (including approvals) is host-precedent and an eligible
         # plugin consumer is consulted only at the generic unknown-command
-        # fallback below. Callback adapters use their separate, validated
-        # callback entry point and never enter this MessageEvent path.
-        if not is_internal and not (event.text or "").lstrip().startswith("/"):
+        # fallback below. Hash commands use their separate exact-declaration
+        # path immediately after authorization. Callback adapters use their
+        # separate, validated callback entry point and never enter this
+        # MessageEvent path.
+        if not is_internal and not (event.text or "").lstrip().startswith(("/", "#")):
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
                 await _get_plugin_manager().dispatch_messaging_event(event)
@@ -11436,6 +11438,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Observer delivery is advisory. Preserve normal agent flow
                 # if its host router/config path is temporarily unavailable.
                 logger.warning("plugin messaging observer dispatch failed", exc_info=True)
+
+        # A hash command is never a generic bypass: its strict token grammar,
+        # exact consumer declaration, exact route, and inbound event grant are
+        # all enforced by the host router.  With no eligible consumer (or an
+        # explicit allow), preserve ordinary text/agent dispatch unchanged.
+        if not is_internal and (event.text or "").startswith("#"):
+            _plugin_messaging_rejection = "This message could not be processed safely."
+            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+            except Exception:
+                logger.warning("plugin messaging hash-command dispatch failed", exc_info=True)
+                return _plugin_messaging_rejection
+            if _messaging_outcome is not None:
+                if _messaging_outcome.action in {"claim", "reject"}:
+                    logger.info(
+                        "plugin messaging consumer %s hash command: plugin=%s",
+                        _messaging_outcome.action,
+                        _messaging_outcome.consumer_plugin_id,
+                    )
+                    return None
+                if _messaging_outcome.action in {"conflict", "error"}:
+                    logger.warning(
+                        "plugin messaging routing rejected hash command: action=%s",
+                        _messaging_outcome.action,
+                    )
+                    return _plugin_messaging_rejection
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
