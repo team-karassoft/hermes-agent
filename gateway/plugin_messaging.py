@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 EventKind = Literal["message", "callback"]
 SubscriptionMode = Literal["observer", "consumer"]
 EventHandler = Callable[["PluginMessageEvent"], Any | Awaitable[Any]]
+DeliveryConfirmationHandler = Callable[["DeliveryConfirmation"], Any | Awaitable[Any]]
 
 _DEFAULT_CALLBACK_TTL_SECONDS = 900
 _MIN_CALLBACK_TTL_SECONDS = 60
@@ -56,6 +57,14 @@ class TopicRoute:
             raise SubscriptionError("route chat_id must be a non-empty string")
         if self.thread_id is not None and not isinstance(self.thread_id, str):
             raise SubscriptionError("route thread_id must be a string or null")
+
+
+@dataclass(frozen=True)
+class DeliveryConfirmation:
+    """Safe facts exposed after the host ledger confirms plugin delivery."""
+
+    state: Literal["delivered"]
+    message_id: str
 
 
 @dataclass(frozen=True)
@@ -306,10 +315,13 @@ class HostMessagingPermissions:
 class PluginMessagingService:
     """PluginContext facade that binds registrations to manifest identity."""
 
-    def __init__(self, *, plugin_id: str, router: PluginMessageRouter, enqueue_text: Callable[..., str] | None = None) -> None:
+    def __init__(self, *, plugin_id: str, router: PluginMessageRouter,
+                 enqueue_text: Callable[..., str] | None = None,
+                 register_delivery_confirmation: Callable[..., None] | None = None) -> None:
         self._plugin_id = plugin_id
         self._router = router
         self._enqueue_text = enqueue_text
+        self._register_delivery_confirmation = register_delivery_confirmation
 
     def subscribe(
         self,
@@ -348,6 +360,22 @@ class PluginMessagingService:
             route=route,
             text=text,
             keyboard=keyboard,
+        )
+
+    def register_delivery_confirmation(
+        self,
+        *,
+        idempotency_key: str,
+        route: TopicRoute,
+        handler: DeliveryConfirmationHandler,
+    ) -> None:
+        """Bind one consumer to this plugin's exact outbound obligation."""
+        if self._register_delivery_confirmation is None:
+            raise PermissionError("plugin delivery confirmations are unavailable")
+        self._register_delivery_confirmation(
+            idempotency_key=idempotency_key,
+            route=route,
+            handler=handler,
         )
 
 

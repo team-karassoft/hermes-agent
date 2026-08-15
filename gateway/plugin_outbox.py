@@ -10,7 +10,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from gateway.delivery_ledger import compute_obligation_id, mark_attempting, mark_delivered, mark_failed, record_obligation
+from gateway.delivery_ledger import (
+    compute_obligation_id, confirm_plugin_delivery, mark_attempting,
+    mark_confirmation_notified, mark_failed, plugin_confirmation_notified,
+    record_obligation,
+)
 from gateway.plugin_messaging import Button, HostMessagingPermissions, InlineKeyboard, TopicRoute
 
 _MAX_INTENT_BYTES = 16 * 1024
@@ -136,6 +140,7 @@ class PluginOutboxService:
     async def deliver_persisted(
         *, adapter, obligation_id: str, intent: PluginOutboundIntent, plugin_id: str | None = None,
         callback_registry=None, content_prefix: str = "",
+        confirmation_notifier=None,
     ) -> bool:
         """Settle an already-accepted intent through a host-selected adapter."""
         mark_attempting(obligation_id)
@@ -167,17 +172,36 @@ class PluginOutboxService:
             return False
         if getattr(result, "success", False):
             message_id = getattr(result, "message_id", None)
-            if tokens and not message_id:
+            if not message_id:
                 mark_failed(obligation_id, "missing-message-id")
                 return False
             try:
-                assert callback_registry is not None
+                if tokens and callback_registry is None:
+                    raise RuntimeError("callback validation is unavailable")
                 for token in tokens:
                     callback_registry.bind_message(token=token, message_id=str(message_id))
             except Exception as exc:
                 mark_failed(obligation_id, type(exc).__name__)
                 return False
-            mark_delivered(obligation_id)
+            message_id = str(message_id)
+            if not confirm_plugin_delivery(obligation_id, message_id):
+                # Preserve any earlier ledger-confirmed message id. A racing or
+                # accidental second send must not turn delivered work back into
+                # a recoverable failure and cause another transport delivery.
+                return False
+            if (confirmation_notifier is not None
+                    and not plugin_confirmation_notified(obligation_id, message_id)):
+                try:
+                    notified = await confirmation_notifier(
+                        plugin_id=plugin_id,
+                        idempotency_key=intent.idempotency_key,
+                        route=intent.route,
+                        message_id=message_id,
+                    )
+                except Exception:
+                    notified = False
+                if notified:
+                    mark_confirmation_notified(obligation_id, message_id)
             return True
         mark_failed(obligation_id, str(getattr(result, "error", "") or "send-failed"))
         return False

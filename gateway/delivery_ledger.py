@@ -108,7 +108,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            plugin_intent TEXT
+            plugin_intent TEXT,
+            delivered_message_id TEXT,
+            confirmation_notified INTEGER NOT NULL DEFAULT 0
         )"""
     )
     # Additive migration: existing final-response rows intentionally remain
@@ -119,6 +121,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     }
     if "plugin_intent" not in columns:
         conn.execute("ALTER TABLE delivery_obligations ADD COLUMN plugin_intent TEXT")
+    if "delivered_message_id" not in columns:
+        conn.execute("ALTER TABLE delivery_obligations ADD COLUMN delivered_message_id TEXT")
+    if "confirmation_notified" not in columns:
+        conn.execute("ALTER TABLE delivery_obligations ADD COLUMN confirmation_notified INTEGER NOT NULL DEFAULT 0")
 
 
 @contextmanager
@@ -230,6 +236,73 @@ def mark_attempting(obligation_id: str) -> None:
 
 def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
+
+
+def confirm_plugin_delivery(obligation_id: str, message_id: str) -> bool:
+    """Atomically bind a delivered plugin row to its transport message id."""
+    if not isinstance(message_id, str) or not message_id.strip():
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='delivered', delivered_message_id=?, updated_at=?, last_error=NULL
+               WHERE obligation_id=? AND plugin_intent IS NOT NULL
+                 AND (delivered_message_id IS NULL OR delivered_message_id=?)""",
+            (message_id, time.time(), obligation_id, message_id),
+        )
+    return cursor.rowcount > 0
+
+
+def mark_confirmation_notified(obligation_id: str, message_id: str) -> None:
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations SET confirmation_notified=1, updated_at=?
+               WHERE obligation_id=? AND state='delivered' AND delivered_message_id=?""",
+            (time.time(), obligation_id, message_id),
+        )
+
+
+def plugin_confirmation_notified(obligation_id: str, message_id: str) -> bool:
+    """Return whether this exact ledger-confirmed delivery was already emitted."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT confirmation_notified FROM delivery_obligations
+               WHERE obligation_id=? AND state='delivered'
+                 AND delivered_message_id=? AND plugin_intent IS NOT NULL""",
+            (obligation_id, message_id),
+        ).fetchone()
+    return bool(row and row[0] == 1)
+
+
+def pending_plugin_delivery_confirmations() -> List[Dict[str, Any]]:
+    """Load delivered plugin rows whose safe callback is still owed.
+
+    Handlers are expected to be idempotent: the ledger is marked only after a
+    successful return, so a process death in that narrow interval can replay.
+    """
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, plugin_intent, delivered_message_id
+               FROM delivery_obligations
+               WHERE state='delivered' AND plugin_intent IS NOT NULL
+                 AND confirmation_notified=0
+                 AND delivered_message_id IS NOT NULL
+               ORDER BY created_at, obligation_id"""
+        ).fetchall()
+    return [
+        {
+            "obligation_id": row[0],
+            "session_key": row[1],
+            "platform": row[2],
+            "chat_id": row[3],
+            "thread_id": row[4],
+            "content": row[5],
+            "plugin_intent": row[6],
+            "message_id": row[7],
+        }
+        for row in rows
+    ]
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:

@@ -375,6 +375,10 @@ class PluginContext:
                 enqueue_text=lambda **kwargs: self._manager.enqueue_plugin_text(
                     plugin_id=self.manifest.key or self.manifest.name, **kwargs
                 ),
+                register_delivery_confirmation=lambda **kwargs:
+                    self._manager.register_plugin_delivery_confirmation(
+                        plugin_id=self.manifest.key or self.manifest.name, **kwargs
+                    ),
             )
         return self._messaging
 
@@ -1387,6 +1391,7 @@ class PluginManager:
         self._messaging_router = PluginMessageRouter()
         self._plugin_outbound_dispatcher: Optional[Callable[..., None]] = None
         self._plugin_callback_registry = None
+        self._plugin_delivery_confirmations: Dict[tuple, Callable] = {}
 
     @property
     def messaging_router(self) -> Any:
@@ -1432,6 +1437,49 @@ class PluginManager:
                     exc_info=True,
                 )
         return obligation_id
+
+    def register_plugin_delivery_confirmation(
+        self, *, plugin_id: str, idempotency_key: str, route: Any,
+        handler: Callable,
+    ) -> None:
+        """Register one manifest-bound consumer for one exact granted route."""
+        from gateway.plugin_messaging import HostMessagingPermissions, TopicRoute
+        from hermes_cli.config import load_config_readonly
+
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("idempotency_key is required")
+        if not isinstance(route, TopicRoute):
+            raise TypeError("route must be a TopicRoute")
+        if not callable(handler):
+            raise TypeError("delivery confirmation handler must be callable")
+        permissions = HostMessagingPermissions.from_raw(load_config_readonly())
+        if not permissions.allows_outbound_text(plugin_id, route):
+            raise PermissionError("plugin has no outbound text grant for route")
+        key = (plugin_id, idempotency_key, route)
+        if key in self._plugin_delivery_confirmations:
+            raise ValueError("delivery confirmation consumer already registered")
+        self._plugin_delivery_confirmations[key] = handler
+
+    async def notify_plugin_delivery_confirmation(
+        self, *, plugin_id: str, idempotency_key: str, route: Any,
+        message_id: str,
+    ) -> bool:
+        """Invoke only the consumer bound to this exact delivered obligation."""
+        from gateway.plugin_messaging import DeliveryConfirmation
+
+        handler = self._plugin_delivery_confirmations.get(
+            (plugin_id, idempotency_key, route)
+        )
+        if handler is None:
+            # No plugin requested this optional callback.  Treat that as a
+            # completed host notification so ordinary text intents cannot stay
+            # indefinitely replay-pending, while exact registrations remain
+            # the only way to observe a delivery.
+            return True
+        result = handler(DeliveryConfirmation(state="delivered", message_id=message_id))
+        if inspect.isawaitable(result):
+            await result
+        return True
 
     def set_plugin_outbound_dispatcher(
         self, dispatcher: Optional[Callable[..., None]]
