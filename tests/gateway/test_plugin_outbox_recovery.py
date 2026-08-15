@@ -87,6 +87,14 @@ def _state(obligation_id: str) -> str:
         ).fetchone()[0]
 
 
+def _confirmation_notified(obligation_id: str) -> int:
+    with sqlite3.connect(dl._db_path()) as conn:
+        return conn.execute(
+            "SELECT confirmation_notified FROM delivery_obligations WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone()[0]
+
+
 def _obligation_count() -> int:
     with dl._connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
@@ -361,6 +369,102 @@ async def test_failed_keyboard_recovery_mints_new_token_and_keeps_ambiguity_mark
     assert recovered.calls[0]["content"] == dl.RECOVERED_MARKER + intent.text
     assert second_token != first_token
     assert _state(obligation_id) == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_delivery_confirmation_handler_replays_after_failure_with_stable_confirmation_id(
+    hermes_home, monkeypatch
+):
+    from gateway.run import GatewayRunner
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: _config())
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="owner", key="owner"), manager)
+    context.messaging.register_delivery_confirmation(
+        idempotency_key="durable-confirmation",
+        route=ROUTE,
+        handler=lambda _confirmation: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    intent = PluginOutboundIntent("durable-confirmation", ROUTE, "Delivered once")
+    service = PluginOutboxService(HostMessagingPermissions.from_raw(_config()))
+    obligation_id = service.enqueue(plugin_id="owner", intent=intent)
+
+    assert await service.deliver_persisted(
+        adapter=_Adapter(SendResult(success=True, message_id="actual-77")),
+        obligation_id=obligation_id,
+        intent=intent,
+        plugin_id="owner",
+        confirmation_notifier=manager.notify_plugin_delivery_confirmation,
+    )
+    assert _state(obligation_id) == "delivered"
+    assert _confirmation_notified(obligation_id) == 0
+
+    restarted = PluginManager()
+    received = []
+    PluginContext(PluginManifest(name="owner", key="owner"), restarted).messaging.register_delivery_confirmation(
+        idempotency_key="durable-confirmation", route=ROUTE, handler=received.append
+    )
+    runner = object.__new__(GatewayRunner)
+
+    assert await runner._replay_plugin_delivery_confirmations(restarted) == 1
+    assert [(item.state, item.message_id, item.confirmation_id) for item in received] == [
+        ("delivered", "actual-77", received[0].confirmation_id)
+    ]
+    assert _confirmation_notified(obligation_id) == 1
+    assert await runner._replay_plugin_delivery_confirmations(restarted) == 0
+
+
+@pytest.mark.asyncio
+async def test_crash_after_confirmation_handler_before_ack_replays_exact_confirmation_id(
+    hermes_home, monkeypatch
+):
+    """Handler delivery is at-least-once; its logical effect keys on the stable id."""
+    from gateway.run import GatewayRunner
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: _config())
+    manager = PluginManager()
+    received = []
+    PluginContext(PluginManifest(name="owner", key="owner"), manager).messaging.register_delivery_confirmation(
+        idempotency_key="crash-after-handler", route=ROUTE, handler=received.append
+    )
+    intent = PluginOutboundIntent("crash-after-handler", ROUTE, "Delivered once")
+    service = PluginOutboxService(HostMessagingPermissions.from_raw(_config()))
+    obligation_id = service.enqueue(plugin_id="owner", intent=intent)
+
+    monkeypatch.setattr(
+        "gateway.plugin_outbox.mark_confirmation_notified",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("process crashed before ack")),
+    )
+    with pytest.raises(RuntimeError, match="before ack"):
+        await service.deliver_persisted(
+            adapter=_Adapter(SendResult(success=True, message_id="actual-88")),
+            obligation_id=obligation_id,
+            intent=intent,
+            plugin_id="owner",
+            confirmation_notifier=manager.notify_plugin_delivery_confirmation,
+        )
+    assert len(received) == 1
+    first_confirmation_id = received[0].confirmation_id
+
+    # Model the dead process that held the lease; the transport delivery stays
+    # durably settled and must never be sent again.
+    with sqlite3.connect(dl._db_path()) as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET confirmation_claim_owner_pid=999999999,
+                   confirmation_claim_owner_started_at=1,
+                   confirmation_claim_expires=0
+               WHERE obligation_id=?""",
+            (obligation_id,),
+        )
+    runner = object.__new__(GatewayRunner)
+    assert await runner._replay_plugin_delivery_confirmations(manager) == 1
+    assert [item.confirmation_id for item in received] == [
+        first_confirmation_id, first_confirmation_id
+    ]
+    assert _confirmation_notified(obligation_id) == 1
 
 
 @pytest.mark.asyncio

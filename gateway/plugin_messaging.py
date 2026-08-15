@@ -8,6 +8,7 @@ host grants become eligible for observer fan-out.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import re
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 EventKind = Literal["message", "callback"]
 SubscriptionMode = Literal["observer", "consumer"]
 EventHandler = Callable[["PluginMessageEvent"], Any | Awaitable[Any]]
+DeliveryConfirmationHandler = Callable[["DeliveryConfirmation"], Any | Awaitable[Any]]
 
 _DEFAULT_CALLBACK_TTL_SECONDS = 900
 _MIN_CALLBACK_TTL_SECONDS = 60
@@ -56,6 +58,26 @@ class TopicRoute:
             raise SubscriptionError("route chat_id must be a non-empty string")
         if self.thread_id is not None and not isinstance(self.thread_id, str):
             raise SubscriptionError("route thread_id must be a string or null")
+
+
+@dataclass(frozen=True)
+class DeliveryConfirmation:
+    """At-least-once handler delivery for a ledger-confirmed message.
+
+    Handlers can run again after a crash between their return and the host's
+    durable acknowledgement. Plugin logical effects must therefore be
+    idempotent by ``confirmation_id``.
+    """
+
+    state: Literal["delivered"]
+    message_id: str
+    confirmation_id: str
+
+
+def delivery_confirmation_id(obligation_id: str, message_id: str) -> str:
+    """Return the stable, opaque identity for one confirmed obligation."""
+    payload = f"{obligation_id}\0{message_id}".encode("utf-8", "replace")
+    return f"dc1.{hashlib.sha256(payload).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -191,15 +213,19 @@ class ConsumerDeclaration:
     command_namespace: str | None = None
     hash_command_namespace: str | None = None
     callback_ownership: str | None = None
+    direct_reply: bool = False
     priority: int = 0
 
     def __post_init__(self) -> None:
+        if type(self.direct_reply) is not bool:
+            raise SubscriptionError("consumer direct reply declaration must be a boolean")
         declared = [
             value
             for value in (
                 self.command_namespace,
                 self.hash_command_namespace,
                 self.callback_ownership,
+                True if self.direct_reply else None,
             )
             if value is not None
         ]
@@ -306,10 +332,13 @@ class HostMessagingPermissions:
 class PluginMessagingService:
     """PluginContext facade that binds registrations to manifest identity."""
 
-    def __init__(self, *, plugin_id: str, router: PluginMessageRouter, enqueue_text: Callable[..., str] | None = None) -> None:
+    def __init__(self, *, plugin_id: str, router: PluginMessageRouter,
+                 enqueue_text: Callable[..., str] | None = None,
+                 register_delivery_confirmation: Callable[..., None] | None = None) -> None:
         self._plugin_id = plugin_id
         self._router = router
         self._enqueue_text = enqueue_text
+        self._register_delivery_confirmation = register_delivery_confirmation
 
     def subscribe(
         self,
@@ -348,6 +377,22 @@ class PluginMessagingService:
             route=route,
             text=text,
             keyboard=keyboard,
+        )
+
+    def register_delivery_confirmation(
+        self,
+        *,
+        idempotency_key: str,
+        route: TopicRoute,
+        handler: DeliveryConfirmationHandler,
+    ) -> None:
+        """Bind an at-least-once handler; effects must key on confirmation_id."""
+        if self._register_delivery_confirmation is None:
+            raise PermissionError("plugin delivery confirmations are unavailable")
+        self._register_delivery_confirmation(
+            idempotency_key=idempotency_key,
+            route=route,
+            handler=handler,
         )
 
 
@@ -457,6 +502,13 @@ class PluginMessageRouter:
 
     @staticmethod
     def _command_matches(envelope: PluginMessageEvent, declaration: ConsumerDeclaration) -> bool:
+        if declaration.direct_reply:
+            return (
+                envelope.kind == "message"
+                and envelope.reply_to_message_id is not None
+                and bool(envelope.reply_to_message_id.strip())
+                and not (envelope.text or "").lstrip().startswith(("/", "#"))
+            )
         if declaration.command_namespace is not None:
             text = (envelope.text or "").strip()
             command = text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""

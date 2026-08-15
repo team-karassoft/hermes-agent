@@ -7732,6 +7732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
         if not claimed:
+            await self._replay_plugin_delivery_confirmations()
             return 0
 
         redelivered = 0
@@ -7775,6 +7776,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         plugin_id=plugin_id,
                         callback_registry=getattr(self, "_plugin_callback_registry", None),
                         content_prefix=RECOVERED_MARKER if row.get("needs_marker") else "",
+                        confirmation_notifier=getattr(
+                            self, "_plugin_delivery_confirmation_notifier", None
+                        ),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -7836,7 +7840,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "clear_resume_pending failed for %s", session_key,
                         exc_info=True,
                     )
+        await self._replay_plugin_delivery_confirmations()
         return redelivered
+
+    async def _replay_plugin_delivery_confirmations(self, manager=None) -> int:
+        """Replay ledger-confirmed plugin callbacks still owed after a crash."""
+        if manager is None:
+            from hermes_cli.plugins import get_plugin_manager
+
+            manager = get_plugin_manager()
+        try:
+            from gateway.delivery_ledger import (
+                claim_plugin_confirmation,
+                mark_confirmation_notified,
+                pending_plugin_delivery_confirmations,
+                release_plugin_confirmation,
+            )
+            from gateway.plugin_messaging import HostMessagingPermissions
+            from gateway.plugin_outbox import PluginOutboxService
+            from hermes_cli.config import load_config_readonly
+
+            rows = await asyncio.to_thread(pending_plugin_delivery_confirmations)
+            permissions = HostMessagingPermissions.from_raw(load_config_readonly())
+        except Exception:
+            logger.debug("plugin confirmation ledger scan failed", exc_info=True)
+            return 0
+
+        notified = 0
+        for row in rows:
+            claim_token = None
+            try:
+                claim_token = await asyncio.to_thread(
+                    claim_plugin_confirmation, row["obligation_id"], row["message_id"]
+                )
+                if claim_token is None:
+                    continue
+                plugin_id, intent = PluginOutboxService.reconstruct_persisted(
+                    row,
+                    permissions=permissions,
+                    callback_registry=getattr(self, "_plugin_callback_registry", None),
+                )
+                delivered = await manager.notify_plugin_delivery_confirmation(
+                    plugin_id=plugin_id,
+                    idempotency_key=intent.idempotency_key,
+                    route=intent.route,
+                    message_id=row["message_id"],
+                    obligation_id=row["obligation_id"],
+                )
+                if not delivered:
+                    await asyncio.to_thread(
+                        release_plugin_confirmation,
+                        row["obligation_id"], row["message_id"], claim_token,
+                    )
+                    continue
+                await asyncio.to_thread(
+                    mark_confirmation_notified,
+                    row["obligation_id"],
+                    row["message_id"],
+                    claim_token,
+                )
+                notified += 1
+            except Exception:
+                # Keep confirmation_notified=0 for a later safe replay.
+                if claim_token is not None:
+                    try:
+                        await asyncio.to_thread(
+                            release_plugin_confirmation,
+                            row["obligation_id"], row["message_id"], claim_token,
+                        )
+                    except Exception:
+                        pass
+                logger.warning(
+                    "Plugin delivery confirmation %s remains pending",
+                    row.get("obligation_id"),
+                    exc_info=True,
+                )
+        return notified
 
     def _bind_plugin_messaging_dispatcher(self, manager=None) -> None:
         """Route accepted plugin intents through gateway-owned tracked tasks."""
@@ -7863,6 +7942,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             database_path=callback_database_path,
         )
         manager.set_plugin_callback_registry(callback_registry)
+        self._plugin_delivery_confirmation_notifier = (
+            manager.notify_plugin_delivery_confirmation
+        )
         # Recovery runs after this startup binding, so retain only the
         # host-owned registry—not an adapter, token, or plugin capability.
         self._plugin_callback_registry = callback_registry
@@ -7891,6 +7973,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     intent=intent,
                     plugin_id=plugin_id,
                     callback_registry=callback_registry,
+                    confirmation_notifier=manager.notify_plugin_delivery_confirmation,
                 )
             )
             background_tasks = getattr(self, "_background_tasks", None)
@@ -11430,7 +11513,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # path immediately after authorization. Callback adapters use their
         # separate, validated callback entry point and never enter this
         # MessageEvent path.
-        if not is_internal and not (event.text or "").lstrip().startswith(("/", "#")):
+        if (
+            not is_internal
+            and getattr(event, "reply_to_message_id", None) is None
+            and not (event.text or "").lstrip().startswith(("/", "#"))
+        ):
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
                 await _get_plugin_manager().dispatch_messaging_event(event)
@@ -11652,6 +11739,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        # Bare tool-approval replies are host control too. Normally the base
+        # adapter's busy-session hook consumes these before they reach this
+        # method, but keep the runner boundary safe for adapters/replays that
+        # dispatch here directly. The canonical busy handler owns resolution
+        # and its user-facing acknowledgement.
+        if _tool_approval_live:
+            _approval_reply = (event.text or "").strip().lower()
+            if _approval_reply in {
+                "approve", "yes", "ok", "okay", "confirm", "y", "👍",
+                "deny", "no", "reject", "cancel", "n", "👎",
+                "always", "approve always", "always approve",
+                "session", "approve session", "session approve",
+            }:
+                if await self._handle_active_session_busy_message(event, _quick_key):
+                    return None
+
+        # Generic direct replies are a distinct, opt-in consumer surface. Run
+        # them only after every host-owned reply primitive above has had the
+        # opportunity to claim or decline the event, and immediately before
+        # ordinary active/new-turn dispatch. Any ambiguity or consumer failure
+        # is terminal and fail-closed.
+        if (
+            not is_internal
+            and getattr(event, "reply_to_message_id", None) is not None
+            and not (event.text or "").lstrip().startswith(("/", "#"))
+        ):
+            _plugin_messaging_rejection = "This message could not be processed safely."
+            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+            except Exception:
+                logger.warning("plugin messaging direct-reply dispatch failed", exc_info=True)
+                return _plugin_messaging_rejection
+            if _messaging_outcome is not None:
+                if _messaging_outcome.action in {"claim", "reject"}:
+                    return None
+                if _messaging_outcome.action in {"conflict", "error"}:
+                    return _plugin_messaging_rejection
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
