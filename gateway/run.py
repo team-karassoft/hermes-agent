@@ -7851,8 +7851,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             manager = get_plugin_manager()
         try:
             from gateway.delivery_ledger import (
+                claim_plugin_confirmation,
                 mark_confirmation_notified,
                 pending_plugin_delivery_confirmations,
+                release_plugin_confirmation,
             )
             from gateway.plugin_messaging import HostMessagingPermissions
             from gateway.plugin_outbox import PluginOutboxService
@@ -7866,7 +7868,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         notified = 0
         for row in rows:
+            claim_token = None
             try:
+                claim_token = await asyncio.to_thread(
+                    claim_plugin_confirmation, row["obligation_id"], row["message_id"]
+                )
+                if claim_token is None:
+                    continue
                 plugin_id, intent = PluginOutboxService.reconstruct_persisted(
                     row,
                     permissions=permissions,
@@ -7879,15 +7887,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id=row["message_id"],
                 )
                 if not delivered:
+                    await asyncio.to_thread(
+                        release_plugin_confirmation,
+                        row["obligation_id"], row["message_id"], claim_token,
+                    )
                     continue
                 await asyncio.to_thread(
                     mark_confirmation_notified,
                     row["obligation_id"],
                     row["message_id"],
+                    claim_token,
                 )
                 notified += 1
             except Exception:
                 # Keep confirmation_notified=0 for a later safe replay.
+                if claim_token is not None:
+                    try:
+                        await asyncio.to_thread(
+                            release_plugin_confirmation,
+                            row["obligation_id"], row["message_id"], claim_token,
+                        )
+                    except Exception:
+                        pass
                 logger.warning(
                     "Plugin delivery confirmation %s remains pending",
                     row.get("obligation_id"),
@@ -11482,6 +11503,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # Generic direct replies are a distinct, opt-in consumer surface.  It
+        # runs only for authorized, ordinary MessageEvents carrying the
+        # adapter-normalized reply id; slash/hash commands and callbacks retain
+        # their host-precedent paths.  Any ambiguity or consumer failure is
+        # terminal and fail-closed.
+        if (
+            not is_internal
+            and getattr(event, "reply_to_message_id", None) is not None
+            and not (event.text or "").lstrip().startswith(("/", "#"))
+        ):
+            _plugin_messaging_rejection = "This message could not be processed safely."
+            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+            except Exception:
+                logger.warning("plugin messaging direct-reply dispatch failed", exc_info=True)
+                return _plugin_messaging_rejection
+            if _messaging_outcome is not None:
+                if _messaging_outcome.action in {"claim", "reject"}:
+                    return None
+                if _messaging_outcome.action in {"conflict", "error"}:
+                    return _plugin_messaging_rejection
+
         # Plain inbound text keeps the observer-only routing contract: fan out
         # authorized observers without changing ordinary agent dispatch. Slash
         # commands are deliberately excluded here; all host command/control
@@ -11491,7 +11535,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # path immediately after authorization. Callback adapters use their
         # separate, validated callback entry point and never enter this
         # MessageEvent path.
-        if not is_internal and not (event.text or "").lstrip().startswith(("/", "#")):
+        if (
+            not is_internal
+            and getattr(event, "reply_to_message_id", None) is None
+            and not (event.text or "").lstrip().startswith(("/", "#"))
+        ):
             try:
                 from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
                 await _get_plugin_manager().dispatch_messaging_event(event)

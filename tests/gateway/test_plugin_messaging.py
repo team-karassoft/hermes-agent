@@ -746,6 +746,123 @@ def test_consumer_requires_a_valid_namespace_declaration() -> None:
         ConsumerDeclaration(command_namespace="slash", hash_command_namespace="hash")
     with pytest.raises(SubscriptionError, match="exactly one namespace"):
         ConsumerDeclaration(hash_command_namespace="hash", callback_ownership="owner")
+    assert ConsumerDeclaration(direct_reply=True).direct_reply
+    for invalid in (1, "true", None):
+        with pytest.raises(SubscriptionError, match="direct reply declaration must be a boolean"):
+            ConsumerDeclaration(direct_reply=invalid)  # type: ignore[arg-type]
+    with pytest.raises(SubscriptionError, match="exactly one namespace"):
+        ConsumerDeclaration(command_namespace="slash", direct_reply=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ("claim", "reject"))
+async def test_gateway_authorized_direct_reply_consumer_is_terminal(monkeypatch, action) -> None:
+    """Exercise the real GatewayRunner boundary, not the router in isolation."""
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    received = []
+    PluginContext(PluginManifest(name="consumer", key="consumer"), manager).messaging.subscribe(
+        subscription_id="direct-replies", routes=[APPROVED_TOPIC],
+        event_types={"message"}, mode="consumer",
+        handler=lambda event: (received.append(event) or {"action": action}),
+        consumer=ConsumerDeclaration(direct_reply=True),
+    )
+    _install_messaging_manager(monkeypatch, manager)
+    event = _trusted_event()
+    event.text = "ordinary reply"
+    event.reply_to_message_id = "trusted-parent-7"
+
+    assert await _gateway_runner_for_messaging()._handle_message(event) is None
+    assert [item.reply_to_message_id for item in received] == ["trusted-parent-7"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_reply_conflict_fails_closed(monkeypatch) -> None:
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    for plugin_id in ("consumer", "other"):
+        PluginContext(PluginManifest(name=plugin_id, key=plugin_id), manager).messaging.subscribe(
+            subscription_id="direct-replies", routes=[APPROVED_TOPIC],
+            event_types={"message"}, mode="consumer",
+            handler=lambda event: {"action": "allow"},
+            consumer=ConsumerDeclaration(direct_reply=True),
+        )
+    _install_messaging_manager(monkeypatch, manager)
+    event = _trusted_event(); event.text = "reply"; event.reply_to_message_id = "parent"
+
+    assert await _gateway_runner_for_messaging()._handle_message(event) == (
+        "This message could not be processed safely."
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_reply_allow_continues_to_agent(monkeypatch) -> None:
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    PluginContext(PluginManifest(name="consumer", key="consumer"), manager).messaging.subscribe(
+        subscription_id="direct-replies", routes=[APPROVED_TOPIC],
+        event_types={"message"}, mode="consumer",
+        handler=lambda event: {"action": "allow"},
+        consumer=ConsumerDeclaration(direct_reply=True),
+    )
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+    calls = []
+    runner._handle_message_with_agent = lambda event, source, key, generation: (
+        calls.append(event.text) or _async_value("agent-result")
+    )
+    event = _trusted_event(); event.text = "continue"; event.reply_to_message_id = "parent"
+
+    assert await runner._handle_message(event) == "agent-result"
+    assert calls == ["continue"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_direct_reply_consumer_never_receives_non_reply(monkeypatch) -> None:
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    received = []
+    PluginContext(PluginManifest(name="consumer", key="consumer"), manager).messaging.subscribe(
+        subscription_id="direct-replies", routes=[APPROVED_TOPIC],
+        event_types={"message"}, mode="consumer",
+        handler=lambda event: (received.append(event) or {"action": "claim"}),
+        consumer=ConsumerDeclaration(direct_reply=True),
+    )
+    _install_messaging_manager(monkeypatch, manager)
+    runner = _gateway_runner_for_messaging()
+    agent_calls = []
+    runner._handle_message_with_agent = lambda event, source, key, generation: (  # type: ignore[method-assign]
+        agent_calls.append(event.text) or _async_value("agent-result")
+    )
+    event = _trusted_event(); event.text = "ordinary non-reply"; event.reply_to_message_id = None
+
+    assert await runner._handle_message(event) == "agent-result"
+    assert received == []
+    assert agent_calls == ["ordinary non-reply"]
+
+
+async def _async_value(value):
+    return value
+
+
+@pytest.mark.asyncio
+async def test_direct_reply_declaration_never_matches_slash_or_callback() -> None:
+    called = []
+    router = PluginMessageRouter(_permissions("consumer"))
+    router.subscribe(
+        plugin_id="consumer", subscription_id="direct", routes=[APPROVED_TOPIC],
+        event_types={"message"}, mode="consumer",
+        handler=lambda event: (called.append(event) or {"action": "claim"}),
+        consumer=ConsumerDeclaration(direct_reply=True),
+    )
+    event = _trusted_event(); event.text = "/help"; event.reply_to_message_id = "parent"
+
+    assert (await router.route(event)).action == "allow"
+    assert called == []
 
 
 

@@ -200,15 +200,19 @@ class ConsumerDeclaration:
     command_namespace: str | None = None
     hash_command_namespace: str | None = None
     callback_ownership: str | None = None
+    direct_reply: bool = False
     priority: int = 0
 
     def __post_init__(self) -> None:
+        if type(self.direct_reply) is not bool:
+            raise SubscriptionError("consumer direct reply declaration must be a boolean")
         declared = [
             value
             for value in (
                 self.command_namespace,
                 self.hash_command_namespace,
                 self.callback_ownership,
+                True if self.direct_reply else None,
             )
             if value is not None
         ]
@@ -485,6 +489,13 @@ class PluginMessageRouter:
 
     @staticmethod
     def _command_matches(envelope: PluginMessageEvent, declaration: ConsumerDeclaration) -> bool:
+        if declaration.direct_reply:
+            return (
+                envelope.kind == "message"
+                and envelope.reply_to_message_id is not None
+                and bool(envelope.reply_to_message_id.strip())
+                and not (envelope.text or "").lstrip().startswith(("/", "#"))
+            )
         if declaration.command_namespace is not None:
             text = (envelope.text or "").strip()
             command = text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""

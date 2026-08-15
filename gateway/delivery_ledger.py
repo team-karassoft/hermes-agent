@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -111,6 +112,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             plugin_intent TEXT,
             delivered_message_id TEXT,
             confirmation_notified INTEGER NOT NULL DEFAULT 0
+            ,send_claim_token TEXT
+            ,send_claim_expires REAL
+            ,send_claim_owner_pid INTEGER
+            ,send_claim_owner_started_at INTEGER
+            ,confirmation_claim_token TEXT
+            ,confirmation_claim_expires REAL
+            ,confirmation_claim_owner_pid INTEGER
+            ,confirmation_claim_owner_started_at INTEGER
         )"""
     )
     # Additive migration: existing final-response rows intentionally remain
@@ -125,6 +134,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE delivery_obligations ADD COLUMN delivered_message_id TEXT")
     if "confirmation_notified" not in columns:
         conn.execute("ALTER TABLE delivery_obligations ADD COLUMN confirmation_notified INTEGER NOT NULL DEFAULT 0")
+    for name, sql_type in (
+        ("send_claim_token", "TEXT"),
+        ("send_claim_expires", "REAL"),
+        ("send_claim_owner_pid", "INTEGER"),
+        ("send_claim_owner_started_at", "INTEGER"),
+        ("confirmation_claim_token", "TEXT"),
+        ("confirmation_claim_expires", "REAL"),
+        ("confirmation_claim_owner_pid", "INTEGER"),
+        ("confirmation_claim_owner_started_at", "INTEGER"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}")
 
 
 @contextmanager
@@ -238,7 +259,55 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
-def confirm_plugin_delivery(obligation_id: str, message_id: str) -> bool:
+def claim_plugin_send(obligation_id: str, *, now: float | None = None,
+                      lease_seconds: float = 60.0) -> str | None:
+    """Atomically lease a plugin obligation whose send has not begun."""
+    now = time.time() if now is None else now
+    token = secrets.token_urlsafe(24)
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT state, send_claim_token, send_claim_expires,
+                      send_claim_owner_pid, send_claim_owner_started_at
+               FROM delivery_obligations
+               WHERE obligation_id=? AND plugin_intent IS NOT NULL
+                 AND delivered_message_id IS NULL""",
+            (obligation_id,),
+        ).fetchone()
+        if row is None or row[0] not in {"pending", "send_claimed", "failed"}:
+            return None
+        old_token, expires, owner_pid, owner_started = row[1:]
+        if old_token is not None and _owner_alive(owner_pid, owner_started):
+            return None
+        if old_token is not None and expires is not None and expires > now:
+            return None
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='send_claimed', send_claim_token=?, send_claim_expires=?,
+                   send_claim_owner_pid=?, send_claim_owner_started_at=?,
+                   updated_at=?, last_error=NULL
+               WHERE obligation_id=? AND plugin_intent IS NOT NULL
+                 AND delivered_message_id IS NULL
+                 AND state IN ('pending', 'send_claimed', 'failed')
+                 AND send_claim_token IS ?""",
+            (token, now + lease_seconds, pid, started, now, obligation_id, old_token),
+        )
+    return token if cursor.rowcount == 1 else None
+
+
+def begin_plugin_send(obligation_id: str, token: str) -> bool:
+    """Fence the transition immediately before entering adapter.send()."""
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations SET state='attempting', updated_at=?
+               WHERE obligation_id=? AND state='send_claimed'
+                 AND send_claim_token=? AND send_claim_expires>?""",
+            (time.time(), obligation_id, token, time.time()),
+        )
+    return cursor.rowcount == 1
+
+
+def confirm_plugin_delivery(obligation_id: str, message_id: str, token: str) -> bool:
     """Atomically bind a delivered plugin row to its transport message id."""
     if not isinstance(message_id, str) or not message_id.strip():
         return False
@@ -247,31 +316,86 @@ def confirm_plugin_delivery(obligation_id: str, message_id: str) -> bool:
             """UPDATE delivery_obligations
                SET state='delivered', delivered_message_id=?, updated_at=?, last_error=NULL
                WHERE obligation_id=? AND plugin_intent IS NOT NULL
-                 AND (delivered_message_id IS NULL OR delivered_message_id=?)""",
-            (message_id, time.time(), obligation_id, message_id),
+                 AND state='attempting' AND send_claim_token=?
+                 AND delivered_message_id IS NULL""",
+            (message_id, time.time(), obligation_id, token),
         )
     return cursor.rowcount > 0
 
 
-def mark_confirmation_notified(obligation_id: str, message_id: str) -> None:
+def claim_plugin_confirmation(obligation_id: str, message_id: str, *,
+                              now: float | None = None,
+                              lease_seconds: float = 60.0) -> str | None:
+    now = time.time() if now is None else now
+    token = secrets.token_urlsafe(24)
+    pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE delivery_obligations SET confirmation_notified=1, updated_at=?
-               WHERE obligation_id=? AND state='delivered' AND delivered_message_id=?""",
-            (time.time(), obligation_id, message_id),
+        row = conn.execute(
+            """SELECT confirmation_claim_token, confirmation_claim_expires,
+                      confirmation_claim_owner_pid, confirmation_claim_owner_started_at
+               FROM delivery_obligations
+               WHERE obligation_id=? AND state='delivered' AND plugin_intent IS NOT NULL
+                 AND delivered_message_id=? AND confirmation_notified=0""",
+            (obligation_id, message_id),
+        ).fetchone()
+        if row is None:
+            return None
+        old_token, expires, owner_pid, owner_started = row
+        if old_token is not None and _owner_alive(owner_pid, owner_started):
+            return None
+        if old_token is not None and expires is not None and expires > now:
+            return None
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET confirmation_claim_token=?, confirmation_claim_expires=?,
+                   confirmation_claim_owner_pid=?, confirmation_claim_owner_started_at=?,
+                   updated_at=?
+               WHERE obligation_id=? AND state='delivered' AND plugin_intent IS NOT NULL
+                 AND delivered_message_id=? AND confirmation_notified=0
+                 AND confirmation_claim_token IS ?""",
+            (token, now + lease_seconds, pid, started, now,
+             obligation_id, message_id, old_token),
         )
+    return token if cursor.rowcount == 1 else None
 
 
-def plugin_confirmation_notified(obligation_id: str, message_id: str) -> bool:
+def mark_confirmation_notified(obligation_id: str, message_id: str, token: str) -> bool:
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations SET confirmation_notified=1, updated_at=?
+               WHERE obligation_id=? AND state='delivered' AND delivered_message_id=?
+                 AND confirmation_notified=0 AND confirmation_claim_token=?""",
+            (time.time(), obligation_id, message_id, token),
+        )
+    return cursor.rowcount == 1
+
+
+def release_plugin_confirmation(obligation_id: str, message_id: str, token: str) -> bool:
+    """Release a completed/failed invocation without completing notification."""
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET confirmation_claim_token=NULL, confirmation_claim_expires=NULL,
+                   confirmation_claim_owner_pid=NULL,
+                   confirmation_claim_owner_started_at=NULL,
+                   updated_at=?
+               WHERE obligation_id=? AND delivered_message_id=?
+                 AND confirmation_notified=0 AND confirmation_claim_token=?""",
+            (time.time(), obligation_id, message_id, token),
+        )
+    return cursor.rowcount == 1
+
+
+def plugin_delivery_matches(obligation_id: str, message_id: str | None = None) -> bool:
     """Return whether this exact ledger-confirmed delivery was already emitted."""
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            """SELECT confirmation_notified FROM delivery_obligations
+            """SELECT delivered_message_id FROM delivery_obligations
                WHERE obligation_id=? AND state='delivered'
-                 AND delivered_message_id=? AND plugin_intent IS NOT NULL""",
-            (obligation_id, message_id),
+                 AND plugin_intent IS NOT NULL""",
+            (obligation_id,),
         ).fetchone()
-    return bool(row and row[0] == 1)
+    return bool(row and (message_id is None or row[0] == message_id))
 
 
 def pending_plugin_delivery_confirmations() -> List[Dict[str, Any]]:
@@ -349,10 +473,23 @@ def sweep_recoverable(
                       content, state, attempts, created_at, plugin_intent,
                       owner_pid, owner_started_at
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'send_claimed', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, plugin_intent, owner_pid, owner_started_at) in rows:
+            if plugin_intent is not None and state not in {"pending", "send_claimed", "failed"}:
+                # Once adapter.send() began, success is unknowable after a
+                # crash. Plugin intents never use the generic duplicate-prone
+                # retry path. Definitive failures likewise require a new
+                # explicit intent/idempotency key.
+                continue
+            if plugin_intent is not None and state == "send_claimed":
+                lease = conn.execute(
+                    "SELECT send_claim_expires FROM delivery_obligations WHERE obligation_id=?",
+                    (oid,),
+                ).fetchone()
+                if lease and lease[0] is not None and lease[0] > now:
+                    continue
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -372,7 +509,9 @@ def sweep_recoverable(
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                       updated_at=?,
+                       send_claim_token=CASE WHEN plugin_intent IS NOT NULL THEN NULL ELSE send_claim_token END,
+                       send_claim_expires=CASE WHEN plugin_intent IS NOT NULL THEN NULL ELSE send_claim_expires END
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )

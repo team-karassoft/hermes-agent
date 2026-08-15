@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from gateway.delivery_ledger import (
-    compute_obligation_id, confirm_plugin_delivery, mark_attempting,
-    mark_confirmation_notified, mark_failed, plugin_confirmation_notified,
-    record_obligation,
+    begin_plugin_send, claim_plugin_confirmation, claim_plugin_send,
+    compute_obligation_id, confirm_plugin_delivery, mark_confirmation_notified,
+    mark_failed, plugin_delivery_matches, record_obligation,
+    release_plugin_confirmation,
 )
 from gateway.plugin_messaging import Button, HostMessagingPermissions, InlineKeyboard, TopicRoute
 
@@ -143,7 +144,9 @@ class PluginOutboxService:
         confirmation_notifier=None,
     ) -> bool:
         """Settle an already-accepted intent through a host-selected adapter."""
-        mark_attempting(obligation_id)
+        send_token = claim_plugin_send(obligation_id)
+        if send_token is None:
+            return plugin_delivery_matches(obligation_id)
         tokens: list[str] = []
         metadata = {"thread_id": intent.route.thread_id}
         if intent.keyboard is not None:
@@ -163,12 +166,15 @@ class PluginOutboxService:
                 rendered.append(rendered_row)
             metadata["inline_keyboard"] = rendered
         try:
+            if not begin_plugin_send(obligation_id, send_token):
+                return False
             result = await adapter.send(
                 chat_id=intent.route.chat_id, content=content_prefix + intent.text,
                 reply_to=None, metadata=metadata,
             )
         except Exception as exc:
-            mark_failed(obligation_id, type(exc).__name__)
+            # The transport may have accepted the message before raising. Keep
+            # the row ambiguous; generic recovery must not blindly resend it.
             return False
         if getattr(result, "success", False):
             message_id = getattr(result, "message_id", None)
@@ -184,13 +190,15 @@ class PluginOutboxService:
                 mark_failed(obligation_id, type(exc).__name__)
                 return False
             message_id = str(message_id)
-            if not confirm_plugin_delivery(obligation_id, message_id):
+            if not confirm_plugin_delivery(obligation_id, message_id, send_token):
                 # Preserve any earlier ledger-confirmed message id. A racing or
                 # accidental second send must not turn delivered work back into
                 # a recoverable failure and cause another transport delivery.
                 return False
-            if (confirmation_notifier is not None
-                    and not plugin_confirmation_notified(obligation_id, message_id)):
+            if confirmation_notifier is not None:
+                confirmation_token = claim_plugin_confirmation(obligation_id, message_id)
+                if confirmation_token is None:
+                    return True
                 try:
                     notified = await confirmation_notifier(
                         plugin_id=plugin_id,
@@ -201,7 +209,9 @@ class PluginOutboxService:
                 except Exception:
                     notified = False
                 if notified:
-                    mark_confirmation_notified(obligation_id, message_id)
+                    mark_confirmation_notified(obligation_id, message_id, confirmation_token)
+                else:
+                    release_plugin_confirmation(obligation_id, message_id, confirmation_token)
             return True
         mark_failed(obligation_id, str(getattr(result, "error", "") or "send-failed"))
         return False

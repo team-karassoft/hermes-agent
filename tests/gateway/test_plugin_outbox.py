@@ -171,7 +171,7 @@ async def test_gateway_bound_telegram_adapter_invokes_manager_callback(monkeypat
     ("adapter", "expected_state"),
     [
         (_Adapter(SendResult(success=True, message_id="sent-1")), "delivered"),
-        (_Adapter(error=RuntimeError("transport down")), "failed"),
+        (_Adapter(error=RuntimeError("transport down")), "attempting"),
         (_Adapter(SendResult(success=False, error="rejected")), "failed"),
     ],
 )
@@ -329,3 +329,69 @@ async def test_success_without_actual_adapter_message_id_is_not_confirmed(
     )
     assert _state(obligation_id) == "failed"
     manager.notify_plugin_delivery_confirmation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_workers_only_one_sends_plugin_obligation() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingAdapter(_Adapter):
+        async def send(self, **kwargs):
+            self.calls.append(kwargs)
+            entered.set()
+            await release.wait()
+            return SendResult(success=True, message_id="only-send")
+
+    service = PluginOutboxService(_permissions())
+    intent = PluginOutboundIntent("send-race", ROUTE, "Once")
+    obligation_id = service.enqueue(plugin_id="idea-incubator", intent=intent)
+    adapter = BlockingAdapter()
+    first = asyncio.create_task(service.deliver_persisted(
+        adapter=adapter, obligation_id=obligation_id, intent=intent,
+        plugin_id="idea-incubator",
+    ))
+    await entered.wait()
+    second = asyncio.create_task(service.deliver_persisted(
+        adapter=adapter, obligation_id=obligation_id, intent=intent,
+        plugin_id="idea-incubator",
+    ))
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, False]
+    assert len(adapter.calls) == 1
+
+
+def test_confirmation_lease_expiry_replays_with_stale_token_fenced() -> None:
+    service = PluginOutboxService(_permissions())
+    intent = PluginOutboundIntent("confirmation-lease", ROUTE, "Delivered")
+    obligation_id = service.enqueue(plugin_id="idea-incubator", intent=intent)
+    send_token = dl.claim_plugin_send(obligation_id, now=1, lease_seconds=60)
+    assert send_token is not None
+    # Use real time for begin because its expiry guard is intentionally based
+    # on the process clock; then bind delivery with the fenced token.
+    with sqlite3.connect(dl._db_path()) as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET send_claim_expires=? WHERE obligation_id=?",
+            (10**12, obligation_id),
+        )
+    assert dl.begin_plugin_send(obligation_id, send_token)
+    assert dl.confirm_plugin_delivery(obligation_id, "delivered-1", send_token)
+
+    first = dl.claim_plugin_confirmation(
+        obligation_id, "delivered-1", now=10, lease_seconds=60,
+    )
+    assert first is not None
+    assert dl.claim_plugin_confirmation(obligation_id, "delivered-1", now=69) is None
+    with sqlite3.connect(dl._db_path()) as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET confirmation_claim_owner_pid=999999999,
+                   confirmation_claim_owner_started_at=1
+               WHERE obligation_id=?""",
+            (obligation_id,),
+        )
+    replay = dl.claim_plugin_confirmation(obligation_id, "delivered-1", now=70)
+    assert replay is not None and replay != first
+    assert not dl.mark_confirmation_notified(obligation_id, "delivered-1", first)
+    assert dl.mark_confirmation_notified(obligation_id, "delivered-1", replay)
