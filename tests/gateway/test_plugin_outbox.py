@@ -297,7 +297,12 @@ async def test_manifest_bound_delivery_confirmation_is_safe_exact_and_idempotent
     assert vars(confirmation) == {
         "state": "delivered",
         "message_id": "platform-42",
+        "confirmation_id": confirmation.confirmation_id,
     }
+    from gateway.plugin_messaging import delivery_confirmation_id
+    assert confirmation.confirmation_id == delivery_confirmation_id(
+        obligation_id, "platform-42"
+    )
     # A plugin that did not request a confirmation must not leave every
     # ordinary outbound delivery permanently replay-pending; it also must not
     # observe this other exact route.
@@ -306,6 +311,7 @@ async def test_manifest_bound_delivery_confirmation_is_safe_exact_and_idempotent
         idempotency_key="confirmed-once",
         route=TopicRoute("telegram", ROUTE.chat_id, "different-thread"),
         message_id="platform-42",
+        obligation_id=obligation_id,
     )
     assert len(received) == 1
 

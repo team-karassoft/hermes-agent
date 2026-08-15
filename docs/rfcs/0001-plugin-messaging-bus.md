@@ -43,7 +43,7 @@ A first-class bus avoids per-plugin private gateway integrations and allows one 
 ```text
 platform adapter
   -> normalized MessageEvent / trusted SessionSource
-  -> gateway authorization and event normalization
+  -> gateway authorization and host-control reply routing
   -> Plugin Messaging Bus subscription router
        -> observer subscriptions (fan-out)
        -> one eligible consumer (command/callback claim)
@@ -101,6 +101,12 @@ Consumers must declare a command namespace or callback ownership pattern. The ro
 
 Conflicting equal-priority consumers fail closed and produce an audit record. If no consumer claims an event, normal agent dispatch continues.
 
+Direct-reply consumers are an explicit consumer variant. They run only after
+all host-owned pending-update, clarify, slash-confirmation, and tool-approval
+reply paths have claimed or declined the event, and before ordinary agent
+dispatch. A host-control reply is never exposed to a direct-reply consumer,
+even when the adapter supplies `reply_to_message_id`.
+
 ## 8. Permission model
 
 ```yaml
@@ -137,6 +143,14 @@ await ctx.messaging.enqueue(
 ```
 
 The gateway validates plugin identity, granted route, destination type, limits and idempotency. It persists the accepted intent before invoking the platform adapter. Delivery outcome is settled durably with retry classification and audit metadata.
+
+Optional delivery-confirmation handlers have documented **at-least-once**
+handler delivery. The host supplies a stable opaque `confirmation_id` derived
+from the durable obligation and the delivered platform message ID. A crash
+after the handler returns but before the host acknowledges it can replay the
+handler with the exact same `confirmation_id`; plugin logical effects must be
+idempotent by that ID. This callback contract does not weaken the atomic send
+lease/fence: a confirmation replay never repeats the transport send.
 
 ## 10. Inline keyboard and callback routing
 

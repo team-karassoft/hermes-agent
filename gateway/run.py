@@ -7885,6 +7885,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     idempotency_key=intent.idempotency_key,
                     route=intent.route,
                     message_id=row["message_id"],
+                    obligation_id=row["obligation_id"],
                 )
                 if not delivered:
                     await asyncio.to_thread(
@@ -11503,29 +11504,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        # Generic direct replies are a distinct, opt-in consumer surface.  It
-        # runs only for authorized, ordinary MessageEvents carrying the
-        # adapter-normalized reply id; slash/hash commands and callbacks retain
-        # their host-precedent paths.  Any ambiguity or consumer failure is
-        # terminal and fail-closed.
-        if (
-            not is_internal
-            and getattr(event, "reply_to_message_id", None) is not None
-            and not (event.text or "").lstrip().startswith(("/", "#"))
-        ):
-            _plugin_messaging_rejection = "This message could not be processed safely."
-            try:
-                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
-                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
-            except Exception:
-                logger.warning("plugin messaging direct-reply dispatch failed", exc_info=True)
-                return _plugin_messaging_rejection
-            if _messaging_outcome is not None:
-                if _messaging_outcome.action in {"claim", "reject"}:
-                    return None
-                if _messaging_outcome.action in {"conflict", "error"}:
-                    return _plugin_messaging_rejection
-
         # Plain inbound text keeps the observer-only routing contract: fan out
         # authorized observers without changing ordinary agent dispatch. Slash
         # commands are deliberately excluded here; all host command/control
@@ -11761,6 +11739,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        # Bare tool-approval replies are host control too. Normally the base
+        # adapter's busy-session hook consumes these before they reach this
+        # method, but keep the runner boundary safe for adapters/replays that
+        # dispatch here directly. The canonical busy handler owns resolution
+        # and its user-facing acknowledgement.
+        if _tool_approval_live:
+            _approval_reply = (event.text or "").strip().lower()
+            if _approval_reply in {
+                "approve", "yes", "ok", "okay", "confirm", "y", "👍",
+                "deny", "no", "reject", "cancel", "n", "👎",
+                "always", "approve always", "always approve",
+                "session", "approve session", "session approve",
+            }:
+                if await self._handle_active_session_busy_message(event, _quick_key):
+                    return None
+
+        # Generic direct replies are a distinct, opt-in consumer surface. Run
+        # them only after every host-owned reply primitive above has had the
+        # opportunity to claim or decline the event, and immediately before
+        # ordinary active/new-turn dispatch. Any ambiguity or consumer failure
+        # is terminal and fail-closed.
+        if (
+            not is_internal
+            and getattr(event, "reply_to_message_id", None) is not None
+            and not (event.text or "").lstrip().startswith(("/", "#"))
+        ):
+            _plugin_messaging_rejection = "This message could not be processed safely."
+            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _messaging_outcome = await _get_plugin_manager().route_messaging_event(event)
+            except Exception:
+                logger.warning("plugin messaging direct-reply dispatch failed", exc_info=True)
+                return _plugin_messaging_rejection
+            if _messaging_outcome is not None:
+                if _messaging_outcome.action in {"claim", "reject"}:
+                    return None
+                if _messaging_outcome.action in {"conflict", "error"}:
+                    return _plugin_messaging_rejection
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages

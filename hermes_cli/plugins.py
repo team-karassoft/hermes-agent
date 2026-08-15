@@ -1462,10 +1462,10 @@ class PluginManager:
 
     async def notify_plugin_delivery_confirmation(
         self, *, plugin_id: str, idempotency_key: str, route: Any,
-        message_id: str,
+        message_id: str, obligation_id: str,
     ) -> bool:
-        """Invoke only the consumer bound to this exact delivered obligation."""
-        from gateway.plugin_messaging import DeliveryConfirmation
+        """Deliver an at-least-once callback for this exact obligation."""
+        from gateway.plugin_messaging import DeliveryConfirmation, delivery_confirmation_id
 
         handler = self._plugin_delivery_confirmations.get(
             (plugin_id, idempotency_key, route)
@@ -1476,7 +1476,11 @@ class PluginManager:
             # indefinitely replay-pending, while exact registrations remain
             # the only way to observe a delivery.
             return True
-        result = handler(DeliveryConfirmation(state="delivered", message_id=message_id))
+        result = handler(DeliveryConfirmation(
+            state="delivered",
+            message_id=message_id,
+            confirmation_id=delivery_confirmation_id(obligation_id, message_id),
+        ))
         if inspect.isawaitable(result):
             await result
         return True

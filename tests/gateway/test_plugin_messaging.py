@@ -698,6 +698,75 @@ plugin_messaging:
     assert not (hermes_home / "gateway.pid").exists()
 
 
+@pytest.mark.asyncio
+async def test_candidate_plugin_loads_by_directory_discovery_and_uses_typed_host_messaging(
+    tmp_path, monkeypatch
+) -> None:
+    """Exercise the real candidate host; only the final transport is stubbed."""
+    from gateway.platforms.base import SendResult
+    from gateway.plugin_outbox import PluginOutboxService
+    from hermes_cli.plugins import PluginManager
+
+    fixture = Path(__file__).parents[1] / "fixtures" / "plugin_messaging_candidate"
+    home = tmp_path / "hermes-home"
+    copied = home / "plugins" / "plugin-messaging-candidate"
+    shutil.copytree(fixture, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    (home / "config.yaml").write_text(
+        """plugins:
+  enabled: [plugin-messaging-candidate]
+plugin_messaging:
+  plugin-messaging-candidate:
+    inbound:
+      - platform: telegram
+        chat_id: "-100123"
+        thread_id: "42"
+        events: [message]
+    outbound:
+      - platform: telegram
+        chat_id: "-100123"
+        thread_id: "42"
+        types: [text]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    loaded = manager._plugins["plugin-messaging-candidate"]
+    assert loaded.enabled and loaded.module is not None
+
+    event = _trusted_event()
+    event.text = "candidate reply"
+    event.reply_to_message_id = "candidate-parent"
+    outcome = await manager.route_messaging_event(event)
+    assert outcome is not None and outcome.action == "claim"
+    assert loaded.module.direct_replies[0].reply_to_message_id == "candidate-parent"
+
+    scheduled = []
+    manager.set_plugin_outbound_dispatcher(lambda **kwargs: scheduled.append(kwargs))
+    obligation_id = loaded.module.request_delivery()
+    assert scheduled == [{
+        "obligation_id": obligation_id,
+        "intent": scheduled[0]["intent"],
+        "plugin_id": "plugin-messaging-candidate",
+    }]
+
+    class TransportStub:
+        async def send(self, **kwargs):
+            assert kwargs["content"] == "candidate outbound"
+            return SendResult(success=True, message_id="candidate-message-1")
+
+    assert await PluginOutboxService.deliver_persisted(
+        adapter=TransportStub(),
+        confirmation_notifier=manager.notify_plugin_delivery_confirmation,
+        **scheduled[0],
+    )
+    assert len(loaded.module.confirmations) == 1
+    confirmation = loaded.module.confirmations[0]
+    assert confirmation.message_id == "candidate-message-1"
+    assert confirmation.confirmation_id
+
+
 def test_duplicate_subscription_id_fails() -> None:
     router = PluginMessageRouter(_permissions("observer"))
     handler = lambda event: None
@@ -775,6 +844,108 @@ async def test_gateway_authorized_direct_reply_consumer_is_terminal(monkeypatch,
 
     assert await _gateway_runner_for_messaging()._handle_message(event) is None
     assert [item.reply_to_message_id for item in received] == ["trusted-parent-7"]
+
+
+def _direct_reply_manager(received):
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    PluginContext(PluginManifest(name="consumer", key="consumer"), manager).messaging.subscribe(
+        subscription_id="direct-replies", routes=[APPROVED_TOPIC],
+        event_types={"message"}, mode="consumer",
+        handler=lambda event: (received.append(event) or {"action": "claim"}),
+        consumer=ConsumerDeclaration(direct_reply=True),
+    )
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_gateway_pending_update_reply_precedes_direct_reply_consumer(
+    tmp_path, monkeypatch
+) -> None:
+    received = []
+    _install_messaging_manager(monkeypatch, _direct_reply_manager(received))
+    runner = _gateway_runner_for_messaging()
+    event = _trusted_event(); event.text = "yes"; event.reply_to_message_id = "update-prompt"
+    key = runner._session_key_for_source(event.source)
+    runner._update_prompt_pending[key] = True
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+    assert "Sent" in await runner._handle_message(event)
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_clarify_reply_precedes_direct_reply_consumer(monkeypatch) -> None:
+    from tools import clarify_gateway
+
+    received = []
+    _install_messaging_manager(monkeypatch, _direct_reply_manager(received))
+    runner = _gateway_runner_for_messaging()
+    event = _trusted_event(); event.text = "the answer"; event.reply_to_message_id = "clarify-prompt"
+    key = runner._session_key_for_source(event.source)
+    clarify_gateway.register("control-clarify", key, "Question?", None)
+    try:
+        assert await runner._handle_message(event) == ""
+        assert clarify_gateway.wait_for_response("control-clarify", timeout=0.1) == "the answer"
+        assert received == []
+    finally:
+        clarify_gateway.clear_session(key)
+
+
+@pytest.mark.asyncio
+async def test_gateway_slash_confirmation_reply_precedes_direct_reply_consumer(monkeypatch) -> None:
+    from tools import slash_confirm
+
+    received = []
+    _install_messaging_manager(monkeypatch, _direct_reply_manager(received))
+    runner = _gateway_runner_for_messaging()
+    event = _trusted_event(); event.text = "once"; event.reply_to_message_id = "confirm-prompt"
+    key = runner._session_key_for_source(event.source)
+    choices = []
+    slash_confirm.register(
+        key, "control-confirm", "reload-mcp",
+        lambda choice: (choices.append(choice) or _async_value("confirmed")),
+    )
+    try:
+        assert await runner._handle_message(event) == "confirmed"
+        assert choices == ["once"]
+        assert received == []
+    finally:
+        slash_confirm.clear(key)
+
+
+@pytest.mark.asyncio
+async def test_gateway_tool_approval_reply_precedes_direct_reply_consumer(monkeypatch) -> None:
+    from tools import approval
+
+    received = []
+    _install_messaging_manager(monkeypatch, _direct_reply_manager(received))
+    runner = _gateway_runner_for_messaging()
+    event = _trusted_event(); event.text = "yes"; event.reply_to_message_id = "approval-prompt"
+    key = runner._session_key_for_source(event.source)
+    entry = approval._ApprovalEntry({"command": "candidate-dangerous-command"})
+    approval._gateway_queues.setdefault(key, []).append(entry)
+
+    class ApprovalAdapter:
+        def resume_typing_for_chat(self, _chat_id):
+            pass
+
+        def _unwrap_ephemeral(self, reply):
+            return reply, 0
+
+        async def _send_with_retry(self, **_kwargs):
+            return None
+
+    runner.adapters = {Platform.TELEGRAM: ApprovalAdapter()}
+    runner._pending_approvals = {}
+    runner._draining = False
+    try:
+        assert await runner._handle_message(event) is None
+        assert entry.event.is_set() and entry.result == "once"
+        assert received == []
+    finally:
+        approval._gateway_queues.pop(key, None)
 
 
 @pytest.mark.asyncio

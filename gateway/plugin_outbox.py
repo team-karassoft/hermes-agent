@@ -205,6 +205,7 @@ class PluginOutboxService:
                         idempotency_key=intent.idempotency_key,
                         route=intent.route,
                         message_id=message_id,
+                        obligation_id=obligation_id,
                     )
                 except Exception:
                     notified = False

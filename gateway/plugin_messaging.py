@@ -8,6 +8,7 @@ host grants become eligible for observer fan-out.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import re
@@ -61,10 +62,22 @@ class TopicRoute:
 
 @dataclass(frozen=True)
 class DeliveryConfirmation:
-    """Safe facts exposed after the host ledger confirms plugin delivery."""
+    """At-least-once handler delivery for a ledger-confirmed message.
+
+    Handlers can run again after a crash between their return and the host's
+    durable acknowledgement. Plugin logical effects must therefore be
+    idempotent by ``confirmation_id``.
+    """
 
     state: Literal["delivered"]
     message_id: str
+    confirmation_id: str
+
+
+def delivery_confirmation_id(obligation_id: str, message_id: str) -> str:
+    """Return the stable, opaque identity for one confirmed obligation."""
+    payload = f"{obligation_id}\0{message_id}".encode("utf-8", "replace")
+    return f"dc1.{hashlib.sha256(payload).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -373,7 +386,7 @@ class PluginMessagingService:
         route: TopicRoute,
         handler: DeliveryConfirmationHandler,
     ) -> None:
-        """Bind one consumer to this plugin's exact outbound obligation."""
+        """Bind an at-least-once handler; effects must key on confirmation_id."""
         if self._register_delivery_confirmation is None:
             raise PermissionError("plugin delivery confirmations are unavailable")
         self._register_delivery_confirmation(
